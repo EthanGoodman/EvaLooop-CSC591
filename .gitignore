@@ -97,5 +97,7 @@ package.json
 
 # Results
 results/*
+# Full-run results JSONs are deliverables (smoke runs and analysis stay ignored)
+!results/*_results.json
 # API keys (never commit)
 *.key
