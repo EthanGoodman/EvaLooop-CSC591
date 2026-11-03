@@ -1,0 +1,5 @@
+model,configuration,n_tasks,success_rate,asl_score
+google/gemma-3-12b-it,pseudocode-mbpp-plus,378,0.733,6.935
+google/gemma-3-12b-it,standard-mbpp-plus,378,0.735,6.684
+qwen/qwen3-30b-a3b-instruct-2507,pseudocode-mbpp-plus,378,0.762,7.191
+qwen/qwen3-30b-a3b-instruct-2507,standard-mbpp-plus,378,0.767,7.239

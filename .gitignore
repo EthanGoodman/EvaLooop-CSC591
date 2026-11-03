@@ -97,3 +97,5 @@ package.json
 
 # Results
 results/*
+# API keys (never commit)
+*.key
