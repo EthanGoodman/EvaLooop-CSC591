@@ -1,0 +1,5 @@
+model,configuration,n_tasks,success_rate,asl_score,asl_bias,pass_drop,pass_at_max,histogram,api_error_tasks,results_file
+google/gemma-3-12b-it,pseudocode-mbpp-plus,378,0.7328,6.9352,9.4639,0.0397,0.6931,101 15 0 0 0 0 0 0 0 0 262,0,gemma-3-12b-it_code_generation_pseudocode_results.json
+google/gemma-3-12b-it,standard-mbpp-plus,378,0.7354,6.6841,9.0885,0.0688,0.6667,100 20 3 2 1 0 0 0 0 0 252,0,gemma-3-12b-it_code_generation_summarization_results.json
+qwen/qwen3-30b-a3b-instruct-2507,pseudocode-mbpp-plus,378,0.7619,7.1913,9.4385,0.0450,0.7169,90 15 1 0 0 0 0 0 1 0 271,0,qwen3-30b-a3b-instruct-2507_code_generation_pseudocode_results.json
+qwen/qwen3-30b-a3b-instruct-2507,standard-mbpp-plus,378,0.7672,7.2389,9.4355,0.0450,0.7222,88 12 2 2 0 1 0 0 0 0 273,0,qwen3-30b-a3b-instruct-2507_code_generation_summarization_results.json

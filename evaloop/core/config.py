@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 
+#: Loop types accepted by EvaluationConfig.loop / get_task_configs()
+SUPPORTED_LOOPS = ("code_generation_summarization", "code_generation_pseudocode")
+
 
 @dataclass
 class EvaluationConfig:
@@ -18,7 +21,11 @@ class EvaluationConfig:
     languages: List[str] = field(default_factory=lambda: ["python"])
     
     # Evaluation parameters
+    loop: str = "code_generation_summarization"
     max_cycles: int = 10
+    limit: Optional[int] = None  # evaluate only the first N tasks (smoke tests)
+    cycle_retries: int = 2  # re-runs of a prompt's cycle after a failed model call
+    max_api_error_rate: float = 0.05  # abort if more of a cycle's prompts still fail
     temperature: float = 0.0
     top_p: float = 1.0
     batch_size: int = 1
@@ -51,10 +58,20 @@ class EvaluationConfig:
     # API configuration
     openai_api_key: Optional[str] = None
     
+    # OpenAI-compatible endpoint (e.g. OpenRouter); setting api_base_url routes the model there
+    api_base_url: Optional[str] = None
+    api_key_env: str = "OPENROUTER_API_KEY"
+    provider_order: Optional[List[str]] = None
+    allow_fallbacks: bool = False
+    max_workers: int = 8
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if not self.model:
             raise ValueError("A model must be specified")
+
+        if self.loop not in SUPPORTED_LOOPS:
+            raise ValueError(f"loop must be one of: {', '.join(SUPPORTED_LOOPS)}")
         
         if self.max_cycles <= 0:
             raise ValueError("max_cycles must be positive")
@@ -109,7 +126,11 @@ class EvaluationConfig:
             "model": self.model,
             "dataset": self.dataset,
             "languages": self.languages,
+            "loop": self.loop,
             "max_cycles": self.max_cycles,
+            "limit": self.limit,
+            "cycle_retries": self.cycle_retries,
+            "max_api_error_rate": self.max_api_error_rate,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "batch_size": self.batch_size,
@@ -120,6 +141,12 @@ class EvaluationConfig:
             "gpu_memory_utilization": self.gpu_memory_utilization,
             "max_model_len": self.max_model_len,
             "trust_remote_code": self.trust_remote_code,
+            "max_new_tokens": self.max_new_tokens,
+            "seed": self.seed,
+            "api_base_url": self.api_base_url,
+            "provider_order": self.provider_order,
+            "allow_fallbacks": self.allow_fallbacks,
+            "max_workers": self.max_workers,
         }
     
     def get_model_config(self) -> Dict[str, Any]:
@@ -129,7 +156,11 @@ class EvaluationConfig:
     def _create_model_config(self, model: str) -> Dict[str, Any]:
         """Create configuration for a specific model."""
         # Determine model type based on model name/path
-        if any(provider in model.lower() for provider in ["gpt", "chatgpt", "openai"]):
+        if self.api_base_url:
+            # Explicit endpoint: the name is an endpoint model id (e.g. "qwen/qwen-2.5-coder-32b-instruct"),
+            # not a HuggingFace path, so skip name-based detection
+            model_type = "openai_compatible"
+        elif any(provider in model.lower() for provider in ["gpt", "chatgpt", "openai"]):
             model_type = "openai"
         elif "claude" in model.lower():
             model_type = "anthropic"
@@ -150,7 +181,21 @@ class EvaluationConfig:
             "top_p": self.top_p,
         }
         
-        if model_type == "openai":
+        if model_type == "openai_compatible":
+            base_config.update({
+                "model_id": model,
+                "api_key": os.environ.get(self.api_key_env),
+                "base_url": self.api_base_url,
+                # Generation budget, matching the protocol of the published runs (1024 new tokens)
+                "max_tokens": self.max_new_tokens,
+                "max_workers": self.max_workers,
+            })
+            if self.provider_order:
+                base_config["provider"] = {
+                    "order": list(self.provider_order),
+                    "allow_fallbacks": self.allow_fallbacks,
+                }
+        elif model_type == "openai":
             base_config.update({
                 "model_id": model,
                 "api_key": self.openai_api_key,
@@ -404,13 +449,18 @@ class EvaluationConfig:
     
     def get_task_configs(self, task_type: str = "code_generation_summarization") -> List[Dict[str, Any]]:
         """Generate task configurations based on task type."""
+        # Shared by every loop so that loops differ only in their inverse task
+        generation_config = {
+            "type": "code_generation",
+            "language": "python",
+            "prompt_template": "Generate Python code for the following task: \n{description}\nReturn only the code, without explanations or comments.",
+        }
+        if task_type == "code_generation_pseudocode":
+            # Prompt template: CodePseudocodeTask.DEFAULT_PROMPT_TEMPLATE
+            return [dict(generation_config), {"type": "code_pseudocode"}]
         if task_type == "code_generation_summarization":
             return [
-                {
-                    "type": "code_generation",
-                    "language": "python",
-                    "prompt_template": "Generate Python code for the following task: \n{description}\nReturn only the code, without explanations or comments.",
-                },
+                dict(generation_config),
                 {
                     "type": "code_summarization", 
                     "prompt_template": "Use one sentence to summarize the following code and start with 'write a python function to':\n\n```\n{code}\n```\n\n```\nwrite a python function to\n```",
@@ -420,4 +470,4 @@ class EvaluationConfig:
             # Code translation is not currently supported but kept as interface
             raise NotImplementedError("Code translation is not currently supported")
         else:
-            raise ValueError(f"Unsupported task type: {task_type}. Currently only 'code_generation_summarization' is supported.")
+            raise ValueError(f"Unsupported task type: {task_type}. Supported loops: {', '.join(SUPPORTED_LOOPS)}.")

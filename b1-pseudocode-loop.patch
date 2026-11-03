@@ -1,0 +1,2045 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..7759aa6
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,11 @@
++.git
++.github
++results
++**/__pycache__
++**/*.egg-info
++.venv
++venv
++.pytest_cache
++.ruff_cache
++*.key
++.env
+diff --git a/.gitignore b/.gitignore
+index 597b1e2..b6c7102 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -96,4 +96,6 @@ package-lock.json
+ package.json
+ 
+ # Results
+-results/*
+\ No newline at end of file
++results/*
++# API keys (never commit)
++*.key
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..62a4dc3
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,36 @@
++# Sandbox for running EvaLoop with API models (e.g. via OpenRouter).
++#
++# Model-generated code is executed by EvalPlus, whose guards are Unix-only and are
++# explicitly "NOT a security sandbox". This image runs everything as an unprivileged
++# user in a container that sees only the code and a mounted results directory.
++# See "Running in Docker" in README.md for the run command.
++
++FROM python:3.10-slim
++
++ENV PYTHONDONTWRITEBYTECODE=1 \
++    PYTHONUNBUFFERED=1 \
++    PIP_NO_CACHE_DIR=1 \
++    PIP_DISABLE_PIP_VERSION_CHECK=1
++
++# CPU-only torch: the model modules import it, but API models never use it.
++# The base image's pip rejects the PyTorch index's wheel names, so upgrade it first;
++# torch's own dependencies come from PyPI.
++RUN pip install --upgrade "pip==24.2" && \
++    pip install --index-url https://download.pytorch.org/whl/cpu \
++        --extra-index-url https://pypi.org/simple "torch==2.6.0"
++
++WORKDIR /app
++COPY requirements.txt ./
++# evalplus and openai are pinned to the versions this fork was tested against
++RUN pip install -r requirements.txt "evalplus==0.3.1" "openai==3.42.1" "pytest==8.3.3" "ruff"
++
++RUN useradd --create-home --uid 1000 app && mkdir -p /app/results /app/logs && chown app:app /app /app/results /app/logs
++COPY --chown=app:app . .
++RUN pip install --no-deps -e . && pip freeze > /app/pip-freeze.txt
++
++USER app
++# Download MBPP+ and compute its ground truth at build time, so runs are offline-reproducible
++RUN python -c "from evaloop.evaluation.py_testing import load_mbpp_dataset; p, _ = load_mbpp_dataset(); print(len(p), 'MBPP+ tasks')"
++
++ENTRYPOINT ["evaloop"]
++CMD ["--help"]
+diff --git a/README.md b/README.md
+index d0200b5..0830a24 100644
+--- a/README.md
++++ b/README.md
+@@ -1,451 +1,117 @@
+-# EvaLooop: LLM Robustness Evaluation Framework
++# EvaLoop extension: code ↔ pseudocode loop
+ 
+-[![arXiv](https://img.shields.io/badge/arXiv-2505.12185-b31b1b.svg)](https://arxiv.org/abs/2505.12185)
+-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+-[![Leaderboard](https://img.shields.io/badge/leaderboard-evalooop.github.io-blue)](https://evalooop.github.io/)
++CSC 591/791 Assignment 4, Option B (new attack).
+ 
+-EvaLoop is a framework for evaluating the robustness of Large Language Models (LLMs) through iterative dual-task cycles. The framework measures how many cycles an LLM can execute before generating code that fails functional testing, providing a quantitative metric for model robustness. It accompanies the paper [*EvaLoop: Assessing LLM Robustness in Programming from a Self-consistency Perspective*](https://arxiv.org/abs/2505.12185); results across models are published on the [leaderboard](https://evalooop.github.io/).
++- **Public fork:** https://github.com/EthanGoodman/EvaLooop-CSC591 (branch `feature/pseudocode-loop`)
++- **Upstream:** [evalooop/EvaLooop](https://github.com/evalooop/EvaLooop) at `ce22fe2` (`dev`); paper: [arXiv:2505.12185](https://arxiv.org/abs/2505.12185)
++- **Patch against upstream:** `b1-pseudocode-loop.patch` (code changes only)
+ 
+-## 🚀 Quick Start
++## The extension
+ 
+-### Installation
++`--loop code_generation_pseudocode` replaces the standard loop's code → one-sentence summary step
++with code → pseudocode. Everything else is identical to the standard loop
++(`--loop code_generation_summarization`), so the format of the intermediate description is the
++only difference between the two.
+ 
+-EvaLoop is not yet published on PyPI — install from source:
+-
+-```bash
+-git clone https://github.com/evalooop/EvaLooop
+-cd EvaLooop
+-pip install -e .
+-```
+-
+-Optional extras:
+-
+-```bash
+-pip install -e ".[vllm]"   # GPU batch inference via vLLM (Linux + CUDA only)
+-pip install -e ".[dev]"    # development tools (pytest, ruff, ...)
+-```
+-
+-After installing, check your environment:
+-
+-```bash
+-evaloop validate_setup                    # full check
+-evaloop validate_setup --check_gpu=False  # skip GPU checks (e.g. on a laptop)
+-```
+-
+-### Basic Usage
+-
+-```bash
+-# Evaluate an OpenAI model on the generation<->summarization loop
+-evaloop evaluate --model "gpt-4"
+-
+-# Evaluate an open-source model with multi-GPU vLLM
+-evaloop evaluate --model "Qwen/Qwen2.5-Coder-32B-Instruct" \
+-                 --gpu_ids "0,1,2,3" \
+-                 --tensor_parallel_size 4 \
+-                 --max_cycles 15
+-
+-# Analyze results (the default ASL metric calls an LLM judge; see "Scoring")
+-evaloop analyze --results_path "results/experiment_results.json" \
+-                --judge_api_key_file api.key
+-```
+-
+-## 🔄 How the Loop Works
+-
+-Each evaluation cycle alternates between two tasks:
+-
+-1. **Initial input**: a natural-language prompt describing a coding task (from MBPP+), formatted as a docstring whose final line is an `assert` statement.
+-2. **Code generation**: the model generates code from the prompt.
+-3. **Functional testing**: the generated code is executed against the dataset's test cases ([EvalPlus](https://github.com/evalplus/evalplus) MBPP+).
+-4. **Code summarization**: the model summarizes the generated code back into a natural-language description.
+-5. **Iteration**: the summary becomes the next cycle's prompt; the loop repeats until the generated code fails testing or `--max_cycles` is reached.
+-
+-The number of loops each task survives is aggregated into the **ASL (Average Sustainable Loops)** score, which weights long survival quadratically and discounts semantic drift at the failure boundary; see [Scoring](#-scoring).
+-
+-### Design note: the retained assert line
+-
+-The summarization step deliberately re-attaches the final `assert` line from the prompt the cycle *started* with, so each new prompt looks like:
+-
+-```
+-"""
+-<model-generated summary>
+-assert similar_elements((3, 4, 5, 6),(5, 7, 4, 10)) == (4, 5)
+-"""
+-```
+-
+-This is intentional, not an artifact: keeping one assert anchors the function name and signature across cycles, so the loop measures **semantic drift** in the model's understanding rather than trivial failures from a renamed function. You will see this line in every generated prompt in the result data. The implementation lives in `CodeSummarizationTask.postprocess` (`evaloop/tasks/code_summarization.py`).
+-
+-### Supported Task Types
+-
+-| Task type | Config name | Status |
++| | Standard loop (baseline) | Pseudocode loop (extension) |
+ |---|---|---|
+-| Code generation | `code_generation` | ✅ Supported |
+-| Code summarization | `code_summarization` | ✅ Supported |
+-| Code translation | `code_translation` | 🧪 Experimental — the task class exists, but config/evaluator support is not yet in the public release (`run_code_translation()` raises `NotImplementedError`) |
+-
+-Want to add your own loop? A new task type is one new file plus a registry entry — no changes to the loop runner. See the [Contributing Guide](CONTRIBUTING.md).
+-
+-## 🛠️ CLI Reference
+-
+-### `evaluate` — Code Generation ↔ Summarization
++| Generation prompt | `Generate Python code for the following task: \n{description}\nReturn only the code, without explanations or comments.` | identical |
++| Inverse prompt | ``Use one sentence to summarize the following code and start with 'write a python function to':\n\n```\n{code}\n```\n\n```\nwrite a python function to\n``` `` | ``Convert the following Python code into pseudocode:\n\n```\n{code}\n```\n\nWrite language-agnostic pseudocode using plain structured keywords (FUNCTION, SET, IF, ELSE, FOR EACH, WHILE, RETURN). Do not use Python syntax and do not copy the Python code verbatim. Return only the pseudocode, without explanations or comments.`` |
++| Output extraction | whole response | first fenced block if present, else whole response |
++| Carried to the next cycle | `"""\n{summary}\n{assert line}\n"""` | `"""\n{pseudocode}\n{assert line}\n"""` |
++| Failure condition | the generated code fails the MBPP+ `base` or `plus` tests (EvalPlus) | identical |
++| Signature stability | the original prompt's final `assert` line is re-attached every cycle | identical (same `postprocess`, inherited) |
+ 
+-```bash
+-evaloop evaluate --model MODEL [OPTIONS]
+-```
+-
+-**Key options:**
+-- `--model`: A single model name or HuggingFace path (required). Examples: `"gpt-4"`, `"Qwen/Qwen2.5-Coder-32B-Instruct"`
+-- `--dataset`: Dataset to use. Currently only `mbpp_plus` is supported (HumanEval is planned).
+-- `--max_cycles`: Maximum evaluation cycles (default: 10)
+-- `--temperature`: Generation temperature (default: 0.0)
+-- `--output_dir`: Results output directory (default: `results/`)
+-- `--gpu_ids`: GPU IDs for vLLM models (e.g., `"0,1,2,3"`)
+-- `--tensor_parallel_size`: GPUs for tensor parallelism (default: 1)
+-
+-**Examples:**
+-
+-```bash
+-# Basic OpenAI evaluation
+-evaloop evaluate --model "gpt-4"
+-
+-# Large model with multi-GPU setup
+-evaloop evaluate --model "meta-llama/Llama-3-70b-instruct-hf" \
+-                 --gpu_ids "0,1,2,3" \
+-                 --tensor_parallel_size 4 \
+-                 --gpu_memory_utilization 0.85
+-
+-# Custom experiment parameters
+-evaloop evaluate --model "deepseek-coder-33b" \
+-                 --max_cycles 20 \
+-                 --temperature 0.2 \
+-                 --experiment_name "deepseek_robust_eval"
+-```
+-
+-To evaluate several models, run `evaloop evaluate` once per model (see [Batch Processing](#batch-processing)).
+-
+-### `analyze` — Result Analysis
+-
+-```bash
+-evaloop analyze --results_path "results/experiment_results.json" [OPTIONS]
+-```
+-
+-**Key options:**
+-- `--results_path`: Path to results JSON file (required)
+-- `--metrics`: Metrics to compute (default: `"ASL,ASL_pow,ASL_bias,pass@1,pass_drop"`, see [Scoring](#-scoring))
+-- `--generate_plots`: Generate visualization plots (default: True)
+-- `--output_dir`: Analysis output directory (default: `<results dir>/analysis`)
+-- `--max_cycles`: Loop budget M of the run (default: value recorded in the results file; for older
+-  files, the value implied by tasks flagged `max_cycles_reached`; else 10 with a warning)
+-
+-**Similarity judge options** (only used by the `ASL` metric, and only for pairs not cached yet):
+-- `--judge_model`: Judge model id (default: `gpt-4-turbo-2024-04-09`, the paper's judge)
+-- `--judge_api_key` / `--judge_api_key_file`: Judge API key (default: `OPENAI_API_KEY`)
+-- `--judge_base_url`: Any OpenAI-compatible endpoint, e.g. a local `vllm serve` server (default: OpenAI)
+-- `--judge_max_tokens`: Answer token budget (default: 10; raise it for reasoning models)
+-- `--judge_temperature`: Judge temperature (default: 0.0)
+-- `--judge_system_prompt`: Optional system message (default: none)
+-- `--judge_prompt_file`: Custom prompt template with `{prompt1}`, `{code1}`, `{prompt2}`, `{code2}`
+-- `--judge_delay`: Seconds between judge calls (default: 0)
+-- `--similarity_path`: Similarity sidecar to read and extend (default: next to the results file)
+-- `--rejudge_failed`: Retry pairs whose previous judge call failed (default: True)
++The model's own output is the only source of perturbation: apart from the fixed prompt templates,
++the only text not written by the model is the original task's assert line, as in the standard loop.
+ 
+-**Examples:**
++## What changed in the existing framework, and why
+ 
+-```bash
+-# Default analysis: all metrics, paper judge (needs an OpenAI key the first time)
+-evaloop analyze --results_path "results/my_experiment_results.json" --judge_api_key_file api.key
+-
+-# Use a self-hosted judge through vLLM's OpenAI-compatible server
+-vllm serve Qwen/Qwen2.5-72B-Instruct --port 8000
+-evaloop analyze --results_path "results/exp.json" \
+-                 --judge_model "Qwen/Qwen2.5-72B-Instruct" \
+-                 --judge_base_url "http://localhost:8000/v1"
+-
+-# Skip the judge: metrics that only need the loop counts
+-evaloop analyze --results_path "results/exp.json" \
+-                 --metrics "ASL_pow,ASL_bias,pass@1,pass_drop" \
+-                 --output_dir "analysis/custom/"
+-```
+-
+-**Outputs** (in `--output_dir`): `analysis_results.json` (all metric values per model, the loop
+-histogram `n_i`, and judge statistics such as the bucket weights `s_i`), `analysis_summary.txt`,
+-and the plots. Judge scores go to the similarity sidecar next to the results file.
+-
+-### `list_models` — Available Models
+-
+-```bash
+-evaloop list_models
+-```
+-
+-### `validate_setup` — System Validation
+-
+-```bash
+-evaloop validate_setup [--check_gpu=False] [--check_api_keys=False]
+-```
+-
+-## 🔧 Configuration
++New files:
+ 
+-### Environment Variables
++| File | Purpose |
++|---|---|
++| `evaloop/tasks/code_pseudocode.py` | `CodePseudocodeTask`: the pseudocode prompt and extraction; inherits the assert-line `postprocess` from `CodeSummarizationTask` |
++| `evaloop/models/openai_compatible.py` | `OpenAICompatibleLLM`: runs OpenRouter models (see below) |
++| `Dockerfile`, `.dockerignore`, `scripts/run_in_docker.sh` | sandbox for executing generated code |
++| `scripts/make_summary.py`, `scripts/analyze_b1.py` | `summary.csv` and the analysis outputs |
++| `tests/test_pseudocode.py`, `tests/test_openai_compatible.py`, `tests/test_evaluator_robustness.py` | unit tests (offline, mocked models) |
+ 
+-```bash
+-export OPENAI_API_KEY="your-openai-api-key"
+-export ANTHROPIC_API_KEY="your-anthropic-api-key"  # Optional
+-```
++Modified files:
+ 
+-### Model Configuration
+-
+-EvaLoop automatically configures models based on their names/paths:
+-
+-- **OpenAI models**: `gpt-4`, `gpt-3.5-turbo`, `gpt-4-turbo`
+-- **HuggingFace paths**: `meta-llama/Llama-3-70b-instruct-hf`
+-- **Pre-registered names**: use `evaloop list_models` to see available options
+-
+-Large models automatically use vLLM for efficient inference when it is installed (`pip install -e ".[vllm]"`).
+-
+-## 📊 Results and Analysis
+-
+-### Output Structure
+-
+-Results are saved in JSON format:
+-
+-```json
+-{
+-  "model": "gpt-4",
+-  "max_cycles": 10,
+-  "prompt_results": [
+-    {
+-      "task_id": "Mbpp/2",
+-      "initial_prompt": "Write a function to find the shared elements ...",
+-      "cycles": [...],
+-      "successful_cycles": 5,
+-      "max_cycles_reached": false
+-    }
+-  ],
+-  "average_successful_cycles": 4.2
+-}
+-```
+-
+-### Metrics
+-
+-`evaloop analyze` reports `ASL` (the headline score, used by default), `ASL_pow`, `ASL_bias`,
+-`pass@1` and `pass_drop`. How each one is computed is described in [Scoring](#-scoring).
+-
+-### Visualization
+-
+-`evaloop analyze` writes three plots to the output directory: `asl_comparison.png` (ASL per
+-model), `cycle_distribution.png` (histogram of sustained loops) and `success_heatmap.png`
+-(sustained loops per task and model, first 50 tasks).
+-
+-## 📐 Scoring
+-
+-The scores below are the ones used in the paper and on the [leaderboard](https://evalooop.github.io/);
+-`evaloop analyze` reproduces the published values exactly when given the same results and judge scores.
+-
+-### Notation
+-
+-- **T**: number of tasks in the run (378 for MBPP Plus).
+-- **M**: maximum number of loops (`max_cycles`, 10 by default).
+-- **i**: number of loops a task *sustains* (`successful_cycles` in the results file): its code passed
+-  the tests in loops 1..i and failed in loop i+1. `i = 0` means it already failed in the first loop,
+-  `i = M` means it never failed.
+-- **n_i**: number of tasks that sustain exactly i loops.
+-- **pass@k**: number of tasks that sustain at least k loops (so pass@1 is the usual one-shot pass count).
+-
+-### ASL: the headline score (default)
+-
+-```
+-ASL = Σ_{i=1..M} n_i · i² · s_i / (T · M)          range [0, M]
+-```
+-
+-- **i²** rewards sustained correctness quadratically: surviving 8 loops counts 4× as much as surviving 4.
+-- **s_i** is the semantic similarity weight of bucket i. It discounts tasks whose last successful
+-  loop had already drifted away from the original intent.
+-
+-**How s_i is obtained.** For every task with a failure boundary (`1 ≤ i < M`), an LLM judge
+-compares the last successful transition with the failing one:
+-
+-| | Prompt | Code |
++| File | Change | Why |
+ |---|---|---|
+-| Side 1 | prompt that fed loop i (the original task if i = 1, else the summary written in loop i−1) | code generated in loop i (passed) |
+-| Side 2 | summary written in loop i, i.e. the prompt of loop i+1 | code generated in loop i+1 (failed) |
+-
+-The judge returns a score `sim ∈ [0, 1]`. A task that sustained i loops went through i prompt
+-transitions; the first i−1 produced passing code, so they count as similarity 1.0, and only the
+-boundary transition uses the judge score. With `m_i` the mean judge score of the tasks in bucket i:
+-
+-```
+-s_i = (m_i + (i − 1)) / i        for 1 ≤ i < M
+-s_i = 1                          for i = M (never failed) and for buckets without judge scores
+-```
+-
+-Because the mean is linear, this equals giving every boundary task the weight `i · (i − 1 + sim)`
+-instead of `i²`, so `ASL ≤ ASL_pow` and the gap is `Σ_tasks i · (1 − sim) / (T · M)`.
+-
+-*Example:* with T = 378 and M = 10, a task that sustains 4 loops and gets a judge score of 0.85
+-contributes `4 · (3 + 0.85) / 3780 = 0.00407` to ASL, versus `16 / 3780 = 0.00423` without the
+-similarity weighting.
+-
+-### All metrics
+-
+-| Metric | Formula | Range | What it measures | Leaderboard field |
+-|---|---|---|---|---|
+-| `ASL` | Σ n_i · i² · s_i / (T · M) | [0, M] | Headline robustness score (default) | `semanticSimilarityScore`, shown as "ASL" |
+-| `ASL_pow` | Σ n_i · i² / (T · M) | [0, M] | ASL without semantic weighting (all s_i = 1) | `aslScore` |
+-| `ASL_bias` | Σ n_i · i² / (pass@1 · M) | [0, M] | Robustness on the tasks the model solves at all, independent of one-shot accuracy (0 if pass@1 = 0) | `robustnessScore` |
+-| `pass@1` | pass@1 / T | [0, 1] | One-shot accuracy | `successRate` |
+-| `pass_drop` | (pass@1 − pass@M) / T | [0, 1] | Absolute accuracy lost within M loops | "drop" (as a percentage) |
+-
+-Only `ASL` needs the judge; the other metrics use the loop counts alone. The leaderboard also
+-averages repeated runs of a model and only lists models with `pass@1 > 0.2` and `ASL_bias > 3`;
+-those steps happen outside this package.
+-
+-### Similarity judge
+-
+-- **Default:** `gpt-4-turbo-2024-04-09` at temperature 0 with a 10-token answer budget, no system
+-  message and the paper's prompt (`evaloop.analysis.similarity.DEFAULT_JUDGE_PROMPT`). Scores
+-  from a different judge or prompt are not comparable with the leaderboard, so compare models
+-  only under the same judge.
+-- **Changing the judge:** the judge is served through the same API layer as the evaluated models
+-  (`OpenAILLM`), so any OpenAI-compatible endpoint works via `--judge_model`, `--judge_base_url`
+-  and `--judge_api_key(_file)`. In Python, pass `judge_config=JudgeConfig(...)` to
+-  `ResultAnalyzer`, or wrap any `BaseLLM` in `SemanticSimilarityJudge(llm)` and pass it as
+-  `judge=...`.
+-- **Caching:** scores are stored in a sidecar next to the results file,
+-  `<results stem>_<judge>_similarity_scores.json`, as
+-  `{"<task_id>_cycle_<i>": {"score": ..., "input_sha256": ...}}`. The judge is only called for pairs
+-  missing from the sidecar, so reruns are free and an interrupted run resumes where it stopped. No
+-  API key is needed when the sidecar is complete.
+-- **Cache validation:** `input_sha256` fingerprints the exact judge prompt (the four judged strings
+-  rendered into the template). If a results file is overwritten (e.g. `evaluate` rerun with the same
+-  `--experiment_name`) or the prompt template changes, mismatching entries are re-judged with a
+-  warning instead of being mixed into the new run. Sidecars from the published data archive
+-  (`{"<task_id>_cycle_<i>": score}`, no hash) are still accepted; their entries cannot be verified
+-  and are used as is.
+-- **Failures:** if the judge call fails or its answer cannot be parsed, the pair is stored as
+-  `null`, left out of its bucket mean (with a warning), and retried on the next run
+-  (`--rejudge_failed=False` keeps it as is). The original scripts recorded such failures as 0.0.
+-- **Parsing:** a bare number is used directly; otherwise the first number that looks like a score
+-  is taken. Results are clamped to [0, 1].
+-
+-### Programmatic scoring
+-
+-```python
+-from evaloop.analysis.analyzer import ResultAnalyzer
+-from evaloop.analysis.similarity import JudgeConfig
+-
+-analyzer = ResultAnalyzer(
+-    "results/exp_results.json",
+-    "results/analysis",
+-    judge_config=JudgeConfig(model="gpt-4-turbo-2024-04-09", api_key="sk-..."),
+-)
+-results = analyzer.analyze()          # all metrics; results["ASL"]["by_model"][model_name]
+-```
+-
+-The pure metric functions (`asl_semantic`, `asl_pow`, `asl_bias`, `pass_at_k`, `pass_drop`,
+-`bucket_similarity`) live in `evaloop.analysis.metrics`.
+-
+-## 🧪 Advanced Usage
+-
+-### Custom Model Registration
+-
+-```python
+-from evaloop.models.registry import ModelRegistry
+-
+-registry = ModelRegistry()
+-registry.register_model("my-custom-model", {
+-    "name": "my-custom-model",
+-    "type": "vllm",
+-    "path": "path/to/my/model",
+-    "max_model_len": 4096,
+-    "tensor_parallel_size": 2
+-})
+-```
+-
+-### Programmatic API
+-
+-```python
+-from evaloop.core.config import EvaluationConfig
+-from evaloop.core.evaluator import EvaLoopEvaluator
+-
+-config = EvaluationConfig(
+-    model="gpt-4",
+-    dataset="mbpp_plus",
+-    max_cycles=10,
+-    temperature=0.0,
+-)
+-
+-evaluator = EvaLoopEvaluator(config)
+-results = evaluator.run_code_generation_summarization()
+-```
+-
+-### Batch Processing
+-
+-```bash
+-# Process multiple experiments
+-for model in "gpt-4" "gpt-3.5-turbo" "deepseek-coder-33b"; do
+-    evaloop evaluate --model "$model" \
+-                     --experiment_name "batch_${model}" \
+-                     --output_dir "results/batch/"
+-done
++| `evaloop/tasks/__init__.py` | import the new task | task registration (the framework's extension point) |
++| `evaloop/core/config.py` | `loop` setting; `code_generation_pseudocode` task configs; generation config shared by both loops | the loop type was hard-coded; sharing guarantees an identical generation step. The standard loop's prompts are unchanged (checked by a test) |
++| `evaloop/core/evaluator.py` | `run()` uses `config.loop`; results record `loop`, `config`, `complete`, `api_error_tasks` | the loop and results filename were hard-coded; provenance for reproducibility |
++| `evaloop/core/evaluator.py` | prompts whose model call failed are re-run (2 retries); a task still failing is stopped and marked `api_error_cycle` instead of being scored as a model failure; abort if > 5% of a cycle fails; checkpoint after every cycle | the API client returns error text on failure, which was tested as code (or became the next prompt) and silently lowered ASL |
++| `evaloop/core/evaluator.py` | `test_results.get("plus_details", [])` | a tester error crashed the whole run with a `KeyError` |
++| `evaloop/core/config.py`, `evaloop/models/factory.py`, `evaloop/cli.py` | `--api_base_url` routes a model to `OpenAICompatibleLLM`; `--provider_order`, `--allow_fallbacks`, `--max_workers`, `--limit`, `--loop` | model ids such as `qwen/...` were routed to local vLLM/HuggingFace; OpenRouter providers serve different quantizations, so each run is pinned to one provider |
++| `evaloop/models/factory.py` | vLLM/HuggingFace backends imported lazily | `open_source_vllm.py` raises `ImportError` without vLLM, so no model of any type could be created without it |
++| `.gitignore` | ignore `*.key` | keep API keys out of git |
++
++`OpenAICompatibleLLM` reuses the existing `OpenAILLM` unchanged and adds: raising on API errors,
++OpenRouter provider pinning, `max_tokens` = 1024 (the published protocol; the existing `openai` path
++sends 4096) and concurrent requests.
++
++## Models, tools and dependencies
++
++| Model (OpenRouter id) | Pinned provider | Precision |
++|---|---|---|
++| `google/gemma-3-12b-it` | `deepinfra/bf16` | bf16 |
++| `qwen/qwen3-30b-a3b-instruct-2507` | `nebius/fp8` | fp8 (no bf16 endpoint available) |
+ 
+-# Analyze all results
+-for result in results/batch/*_results.json; do
+-    evaloop analyze --results_path "$result"
+-done
+-```
++Both models are in the assignment data package, which was used only as a cross-check of the
++standard-loop runs. No LLM other than the two evaluated models was used (no similarity judge).
++API cost: $0.51 for the four full runs (OpenRouter account usage).
+ 
+-## 🤝 Contributing
++- **Docker** (tested with Docker Desktop 29.7.2). The image is `python:3.10-slim` with CPU-only
++  `torch==2.6.0`, `evalplus==0.3.1` (MBPP+ v0.2.0, 378 tasks, downloaded at build time),
++  `openai==3.42.1` and `requirements.txt`; `pip freeze` is saved in the image at `/app/pip-freeze.txt`.
++- **Bash** to run `scripts/run_in_docker.sh` (Git Bash on Windows).
++- **Python ≥ 3.9** on the host for `scripts/make_summary.py` and `scripts/analyze_b1.py`
++  (standard library plus this repo's `evaloop.analysis.metrics`).
++- An **OpenRouter API key**.
+ 
+-We welcome contributions — new loop/task types especially! Please see the [Contributing Guide](CONTRIBUTING.md) for the development setup, the "add a new loop type" walkthrough, and PR expectations.
++**Sandbox.** Generated code is untrusted, and EvalPlus's guards are Unix-only: on native Windows,
++EvalPlus scores even correct code as `timeout` because `import resource` fails. All runs therefore
++execute inside the container, as an unprivileged user with all capabilities dropped and memory/PID
++limits; only `results/` and `logs/` are mounted from the host.
+ 
+-### Development Setup
++## How to run
+ 
+ ```bash
+-git clone https://github.com/evalooop/EvaLooop
+-cd EvaLooop
+-pip install -e ".[dev]"
+-```
+-
+-### Running Tests
++docker build -t evaloop-b1 .
++echo "<openrouter key>" > openrouter.key     # ignored by git and docker
+ 
+-```bash
+-pytest
+-ruff check evaloop tests
++# usage: scripts/run_in_docker.sh <model id> <provider> <loop>
++bash scripts/run_in_docker.sh google/gemma-3-12b-it            deepinfra/bf16 code_generation_summarization
++bash scripts/run_in_docker.sh google/gemma-3-12b-it            deepinfra/bf16 code_generation_pseudocode
++bash scripts/run_in_docker.sh qwen/qwen3-30b-a3b-instruct-2507 nebius/fp8     code_generation_summarization
++bash scripts/run_in_docker.sh qwen/qwen3-30b-a3b-instruct-2507 nebius/fp8     code_generation_pseudocode
+ ```
+ 
+-The unit test suite runs without GPU, API keys, or the heavy model dependencies.
+-
+-## 📖 Citation
++Each run writes `results/<model>_<loop>_results.json` and `logs/<model>_<loop>/evaloop.log`.
++The four runs above used `--max_workers 24` (concurrency only; it does not affect outputs).
+ 
+-If you use EvaLoop in your research, please cite:
+-
+-```bibtex
+-@article{fang2024evaloop,
+-  title={EvaLoop: Assessing LLM Robustness in Programming from a Self-consistency Perspective},
+-  author={Fang, Sen and Ding, Weiyuan and Xu, Bowen},
+-  journal={arXiv preprint arXiv:2505.12185},
+-  year={2024},
+-  url={https://arxiv.org/abs/2505.12185}
+-}
+-```
++Settings of every run, recorded in each results file's `config`: temperature 0.0, top-p 1.0, at most
++1024 new tokens, at most 10 cycles, one run per configuration, all 378 MBPP+ tasks (no sampling),
++OpenRouter provider pinned with fallbacks disabled.
+ 
+-## 📄 License
++Unit tests: `docker run --rm --entrypoint python evaloop-b1 -m pytest`
+ 
+-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
++## Reproducing the reported numbers
+ 
+-## 🙏 Acknowledgments
+-
+-- Built with [Python Fire](https://github.com/google/python-fire) for CLI interface
+-- Uses [vLLM](https://github.com/vllm-project/vllm) for efficient model inference
+-- Evaluation dataset from [MBPP](https://github.com/google-research/google-research/tree/master/mbpp)
+-- Code testing powered by [EvalPlus](https://github.com/evalplus/evalplus)
+-
+-## 📞 Support
++| Output | Command | Definition |
++|---|---|---|
++| `summary.csv` | `python scripts/make_summary.py results/*_results.json --out summary.csv --extended summary_extended.csv` | `success_rate` = pass@1 / 378; `asl_score` = `ASL_pow` = Σᵢ nᵢ·i² / (378·10), the leaderboard's `aslScore` (no similarity judge). Computed with `evaloop.analysis.metrics`, which reproduces the leaderboard's `aslScore` and `successRate` for both models when applied to the data package |
++| `summary_extended.csv` | same command | adds ASL_bias, pass_drop, pass@10, the loop histogram and API-error counts |
++| `results/analysis/b1_report.md`, `b1_stats.json` | `python scripts/analyze_b1.py --results results --out results/analysis --package <assignment4-data>/loops --package_ids "google/gemma-3-12b-it=gemma-3-12b-it,qwen/qwen3-30b-a3b-instruct-2507=qwen3-30b-a3b-instruct-2507"` | per-run metrics, paired per-task comparison (exact sign test), ranking, pseudocode format checks, agreement with the data package |
++| `results/analysis/b1_failures.md` | same command (`--seed 0 --sample 15` by default) | seeded sample of failed loops used for the manual failure analysis |
+ 
+-- 🏆 [Leaderboard](https://evalooop.github.io/)
+-- 📄 [Paper](https://arxiv.org/abs/2505.12185)
+-- 🐛 [Issue Tracker](https://github.com/evalooop/EvaLooop/issues)
++Results files: `results/gemma-3-12b-it_code_generation_{summarization,pseudocode}_results.json`
++and `results/qwen3-30b-a3b-instruct-2507_code_generation_{summarization,pseudocode}_results.json`.
+ 
+----
++## License
+ 
+-**EvaLoop** - Robust LLM Evaluation Made Simple 🔄
++MIT, as upstream (see `LICENSE`).
+diff --git a/evaloop/cli.py b/evaloop/cli.py
+index 7f2bb4f..ba8f26d 100644
+--- a/evaloop/cli.py
++++ b/evaloop/cli.py
+@@ -71,7 +71,9 @@ class EvaLoopCLI:
+         self,
+         model: str,
+         dataset: str = "mbpp_plus",
++        loop: str = "code_generation_summarization",
+         max_cycles: int = 10,
++        limit: Optional[int] = None,
+         temperature: float = 0.0,
+         top_p: float = 1.0,
+         output_dir: str = "results/",
+@@ -92,6 +94,11 @@ class EvaLoopCLI:
+         preferred_batch_size: int = 64,
+         is_chat_model: bool = True,
+         system_prompt: str = "You are a helpful programming assistant.",
++        api_base_url: Optional[str] = None,
++        api_key_env: str = "OPENROUTER_API_KEY",
++        provider_order: Optional[str] = None,
++        allow_fallbacks: bool = False,
++        max_workers: int = 8,
+     ) -> Dict[str, Any]:
+         """
+         Run code generation and summarization evaluation experiment.
+@@ -107,6 +114,9 @@ class EvaLoopCLI:
+             model: Single model name/path to evaluate.
+                    Examples: "gpt-4", "Qwen/Qwen2.5-Coder-32B-Instruct"
+             dataset: Dataset to use for evaluation. Currently only "mbpp_plus" is supported.
++            loop: Loop type: "code_generation_summarization" (standard loop) or
++                  "code_generation_pseudocode" (code <-> pseudocode loop).
++            limit: Evaluate only the first N tasks (for smoke tests; omit for real runs).
+             max_cycles: Maximum number of evaluation cycles to run.
+             temperature: Temperature for model generation (0.0 for greedy decoding).
+             top_p: Top-p (nucleus) sampling parameter.
+@@ -114,6 +124,12 @@ class EvaLoopCLI:
+             log_level: Logging level (DEBUG, INFO, WARNING, ERROR).
+             experiment_name: Name for the experiment (auto-generated if None).
+             openai_api_key: OpenAI API key (can also be set via OPENAI_API_KEY env var).
++            api_base_url: OpenAI-compatible endpoint, e.g. "https://openrouter.ai/api/v1". When set,
++                          --model is that endpoint's model id and is served via the API.
++            api_key_env: Environment variable holding the endpoint's API key.
++            provider_order: Comma-separated OpenRouter provider slugs to pin (e.g. "deepinfra").
++            allow_fallbacks: Whether OpenRouter may fall back to providers outside provider_order.
++            max_workers: Concurrent API requests per batch.
+             gpu_ids: Comma-separated GPU IDs for VLLM models (e.g., "0,1,2,3").
+             tensor_parallel_size: Number of GPUs for tensor parallelism.
+             gpu_memory_utilization: GPU memory utilization ratio for VLLM.
+@@ -183,7 +199,9 @@ class EvaLoopCLI:
+         config = EvaluationConfig(
+             model=model.strip(),
+             dataset=dataset,
++            loop=loop,
+             max_cycles=max_cycles,
++            limit=limit,
+             temperature=temperature,
+             top_p=top_p,
+             output_dir=output_dir,
+@@ -203,7 +221,14 @@ class EvaLoopCLI:
+             is_chat_model=is_chat_model,
+             system_prompt=system_prompt,
+             openai_api_key=openai_api_key,
++            api_base_url=api_base_url,
++            api_key_env=api_key_env,
++            provider_order=_split_list_arg(provider_order) if provider_order else None,
++            allow_fallbacks=allow_fallbacks,
++            max_workers=max_workers,
+         )
++        if api_base_url and not os.environ.get(api_key_env):
++            raise ValueError(f"--api_base_url is set but the API key variable {api_key_env} is empty")
+         # Log model type detection results
+         model_config = config.get_model_config()
+         model_type = model_config["type"]
+@@ -214,12 +239,12 @@ class EvaLoopCLI:
+                            f"batch_size={model_config['batch_config']['preferred_batch_size']}")
+         elif model_type == "huggingface":
+             self.logger.info(f"  HuggingFace config: device={model_config['device']}")
+-        elif model_type in ["openai", "anthropic"]:
++        elif model_type in ["openai", "anthropic", "openai_compatible"]:
+             self.logger.info(f"  API config: model_id={model_config['model_id']}")
+ 
+         # Create and run evaluator
+         evaluator = EvaLoopEvaluator(config)
+-        results = evaluator.run_code_generation_summarization()
++        results = evaluator.run()
+ 
+         self.logger.info("Evaluation completed successfully")
+         return results
+diff --git a/evaloop/core/config.py b/evaloop/core/config.py
+index 3ad780a..2a7696a 100644
+--- a/evaloop/core/config.py
++++ b/evaloop/core/config.py
+@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
+ from typing import List, Optional, Dict, Any
+ from pathlib import Path
+ 
++#: Loop types accepted by EvaluationConfig.loop / get_task_configs()
++SUPPORTED_LOOPS = ("code_generation_summarization", "code_generation_pseudocode")
++
+ 
+ @dataclass
+ class EvaluationConfig:
+@@ -18,7 +21,11 @@ class EvaluationConfig:
+     languages: List[str] = field(default_factory=lambda: ["python"])
+     
+     # Evaluation parameters
++    loop: str = "code_generation_summarization"
+     max_cycles: int = 10
++    limit: Optional[int] = None  # evaluate only the first N tasks (smoke tests)
++    cycle_retries: int = 2  # re-runs of a prompt's cycle after a failed model call
++    max_api_error_rate: float = 0.05  # abort if more of a cycle's prompts still fail
+     temperature: float = 0.0
+     top_p: float = 1.0
+     batch_size: int = 1
+@@ -51,10 +58,20 @@ class EvaluationConfig:
+     # API configuration
+     openai_api_key: Optional[str] = None
+     
++    # OpenAI-compatible endpoint (e.g. OpenRouter); setting api_base_url routes the model there
++    api_base_url: Optional[str] = None
++    api_key_env: str = "OPENROUTER_API_KEY"
++    provider_order: Optional[List[str]] = None
++    allow_fallbacks: bool = False
++    max_workers: int = 8
++
+     def __post_init__(self):
+         """Validate configuration after initialization."""
+         if not self.model:
+             raise ValueError("A model must be specified")
++
++        if self.loop not in SUPPORTED_LOOPS:
++            raise ValueError(f"loop must be one of: {', '.join(SUPPORTED_LOOPS)}")
+         
+         if self.max_cycles <= 0:
+             raise ValueError("max_cycles must be positive")
+@@ -109,7 +126,11 @@ class EvaluationConfig:
+             "model": self.model,
+             "dataset": self.dataset,
+             "languages": self.languages,
++            "loop": self.loop,
+             "max_cycles": self.max_cycles,
++            "limit": self.limit,
++            "cycle_retries": self.cycle_retries,
++            "max_api_error_rate": self.max_api_error_rate,
+             "temperature": self.temperature,
+             "top_p": self.top_p,
+             "batch_size": self.batch_size,
+@@ -120,6 +141,12 @@ class EvaluationConfig:
+             "gpu_memory_utilization": self.gpu_memory_utilization,
+             "max_model_len": self.max_model_len,
+             "trust_remote_code": self.trust_remote_code,
++            "max_new_tokens": self.max_new_tokens,
++            "seed": self.seed,
++            "api_base_url": self.api_base_url,
++            "provider_order": self.provider_order,
++            "allow_fallbacks": self.allow_fallbacks,
++            "max_workers": self.max_workers,
+         }
+     
+     def get_model_config(self) -> Dict[str, Any]:
+@@ -129,7 +156,11 @@ class EvaluationConfig:
+     def _create_model_config(self, model: str) -> Dict[str, Any]:
+         """Create configuration for a specific model."""
+         # Determine model type based on model name/path
+-        if any(provider in model.lower() for provider in ["gpt", "chatgpt", "openai"]):
++        if self.api_base_url:
++            # Explicit endpoint: the name is an endpoint model id (e.g. "qwen/qwen-2.5-coder-32b-instruct"),
++            # not a HuggingFace path, so skip name-based detection
++            model_type = "openai_compatible"
++        elif any(provider in model.lower() for provider in ["gpt", "chatgpt", "openai"]):
+             model_type = "openai"
+         elif "claude" in model.lower():
+             model_type = "anthropic"
+@@ -150,7 +181,21 @@ class EvaluationConfig:
+             "top_p": self.top_p,
+         }
+         
+-        if model_type == "openai":
++        if model_type == "openai_compatible":
++            base_config.update({
++                "model_id": model,
++                "api_key": os.environ.get(self.api_key_env),
++                "base_url": self.api_base_url,
++                # Generation budget, matching the protocol of the published runs (1024 new tokens)
++                "max_tokens": self.max_new_tokens,
++                "max_workers": self.max_workers,
++            })
++            if self.provider_order:
++                base_config["provider"] = {
++                    "order": list(self.provider_order),
++                    "allow_fallbacks": self.allow_fallbacks,
++                }
++        elif model_type == "openai":
+             base_config.update({
+                 "model_id": model,
+                 "api_key": self.openai_api_key,
+@@ -404,13 +449,18 @@ class EvaluationConfig:
+     
+     def get_task_configs(self, task_type: str = "code_generation_summarization") -> List[Dict[str, Any]]:
+         """Generate task configurations based on task type."""
++        # Shared by every loop so that loops differ only in their inverse task
++        generation_config = {
++            "type": "code_generation",
++            "language": "python",
++            "prompt_template": "Generate Python code for the following task: \n{description}\nReturn only the code, without explanations or comments.",
++        }
++        if task_type == "code_generation_pseudocode":
++            # Prompt template: CodePseudocodeTask.DEFAULT_PROMPT_TEMPLATE
++            return [dict(generation_config), {"type": "code_pseudocode"}]
+         if task_type == "code_generation_summarization":
+             return [
+-                {
+-                    "type": "code_generation",
+-                    "language": "python",
+-                    "prompt_template": "Generate Python code for the following task: \n{description}\nReturn only the code, without explanations or comments.",
+-                },
++                dict(generation_config),
+                 {
+                     "type": "code_summarization", 
+                     "prompt_template": "Use one sentence to summarize the following code and start with 'write a python function to':\n\n```\n{code}\n```\n\n```\nwrite a python function to\n```",
+@@ -420,4 +470,4 @@ class EvaluationConfig:
+             # Code translation is not currently supported but kept as interface
+             raise NotImplementedError("Code translation is not currently supported")
+         else:
+-            raise ValueError(f"Unsupported task type: {task_type}. Currently only 'code_generation_summarization' is supported.")
+\ No newline at end of file
++            raise ValueError(f"Unsupported task type: {task_type}. Supported loops: {', '.join(SUPPORTED_LOOPS)}.")
+\ No newline at end of file
+diff --git a/evaloop/core/evaluator.py b/evaloop/core/evaluator.py
+index 64587ee..286409b 100644
+--- a/evaloop/core/evaluator.py
++++ b/evaloop/core/evaluator.py
+@@ -2,6 +2,7 @@
+ 
+ import json
+ import logging
++from concurrent.futures import ThreadPoolExecutor
+ from typing import Dict, Any, List
+ from pathlib import Path
+ 
+@@ -34,14 +35,14 @@ class EvaLoopEvaluator:
+         
+         self.logger.info(f"Initialized EvaLoopEvaluator with config: {config.experiment_name}")
+     
+-    def run_code_generation_summarization(self) -> List[Dict[str, Any]]:
++    def run(self) -> List[Dict[str, Any]]:
+         """
+-        Run code generation and summarization evaluation.
++        Run the loop selected by ``config.loop`` (e.g. code generation <-> summarization).
+         
+         Returns:
+             List of evaluation results (single model result in list for consistency).
+         """
+-        self.logger.info("Starting code generation and summarization evaluation")
++        self.logger.info(f"Starting {self.config.loop} evaluation")
+         
+         # Setup components
+         model = self._create_model()
+@@ -53,8 +54,12 @@ class EvaLoopEvaluator:
+         model_result = self._run_evaluation_cycles(model, tasks, prompts, py_problems, tester)
+         
+         # Save and return results
+-        self._save_results([model_result], "code_generation_summarization")
++        self._save_results([model_result], self.config.loop)
+         return [model_result]
++
++    def run_code_generation_summarization(self) -> List[Dict[str, Any]]:
++        """Backward-compatible alias of run(); runs the loop selected by ``config.loop``."""
++        return self.run()
+     
+     def run_code_translation(self) -> Dict[str, Any]:
+         """
+@@ -77,7 +82,7 @@ class EvaLoopEvaluator:
+     
+     def _create_tasks(self):
+         """Create task instances."""
+-        task_configs = self.config.get_task_configs("code_generation_summarization")
++        task_configs = self.config.get_task_configs(self.config.loop)
+         tasks = [self.task_factory.create_task(config) for config in task_configs]
+         self.logger.info(f"Created {len(tasks)} tasks for evaluation")
+         return tasks
+@@ -94,6 +99,9 @@ class EvaLoopEvaluator:
+                 "task_id": task_id,
+                 "prompt": problem["prompt"]
+             })
++        if self.config.limit:
++            # First N tasks in dataset order; meant for smoke tests, not for reported runs
++            prompts = prompts[: self.config.limit]
+         
+         self.logger.info(f"Prepared {len(prompts)} prompts from MBPP dataset")
+         return prompts, py_problems
+@@ -121,13 +129,16 @@ class EvaLoopEvaluator:
+             current_cycle += 1
+             self.logger.info(f"Starting cycle {current_cycle}/{self.config.max_cycles}")
+             
+-            # Run single cycle
++            # Run single cycle, re-running prompts whose model calls failed
+             cycle_output = cycle_runner.run_single_cycle(current_prompts, current_cycle)
++            self._retry_errored_prompts(cycle_runner, model, cycle_output, current_prompts, current_cycle)
+             
+             # Process results and prepare for next cycle
+             current_prompts = self._process_cycle_results(
+                 cycle_output, model_result, tasks, py_problems, tester, current_cycle
+             )
++            # Checkpoint, so an aborted run keeps every completed cycle
++            self._save_results([model_result], self.config.loop)
+             
+             if not current_prompts:
+                 self.logger.info(f"All prompts failed or completed after cycle {current_cycle}")
+@@ -138,12 +149,48 @@ class EvaLoopEvaluator:
+         
+         return model_result
+     
++    @staticmethod
++    def _has_task_error(cycle_result: Dict[str, Any]) -> bool:
++        """True if a model call of this cycle failed (an infrastructure error, not a model output)."""
++        return any(key.startswith("task_") and key.endswith("_error") for key in cycle_result)
++
++    def _retry_errored_prompts(self, cycle_runner, model, cycle_output, prompts, cycle_number):
++        """Re-run, in place, the cycle of every prompt whose model call raised.
++
++        Failures are retried one prompt at a time, so a single failing prompt cannot fail a
++        whole batch again. Prompts still failing after ``cycle_retries`` keep their error.
++        """
++        results = cycle_output["cycle_results"]
++        prompt_by_id = {prompt["task_id"]: prompt for prompt in prompts}
++        workers = getattr(model, "max_workers", 1)
++
++        def rerun(prompt):
++            return cycle_runner.run_single_cycle([prompt], cycle_number)["cycle_results"][0]
++
++        for attempt in range(1, self.config.cycle_retries + 1):
++            errored = [i for i, result in enumerate(results) if self._has_task_error(result)]
++            if not errored:
++                return
++            self.logger.warning(
++                f"Cycle {cycle_number}: re-running {len(errored)} prompt(s) whose model calls failed "
++                f"(retry {attempt}/{self.config.cycle_retries})"
++            )
++            with ThreadPoolExecutor(max_workers=workers) as pool:
++                reruns = list(pool.map(rerun, [prompt_by_id[results[i]["task_id"]] for i in errored]))
++            for index, result in zip(errored, reruns):
++                results[index] = result
++    
+     def _initialize_model_result(self, model, prompts) -> Dict[str, Any]:
+         """Initialize the model result structure."""
+         model_result = {
+             "model": str(model),
+             # Loop budget M; needed by the analyzer to normalize the ASL metrics
+             "max_cycles": self.config.max_cycles,
++            # Provenance: which loop and settings produced this run
++            "loop": self.config.loop,
++            "config": self.config.to_dict(),
++            # False in per-cycle checkpoints; True once every cycle has run
++            "complete": False,
+             "prompt_results": []
+         }
+         
+@@ -162,6 +209,7 @@ class EvaLoopEvaluator:
+     def _process_cycle_results(self, cycle_output, model_result, tasks, py_problems, tester, current_cycle) -> List[Dict[str, Any]]:
+         """Process cycle results and return prompts for next cycle."""
+         next_cycle_prompts = []
++        api_errors = 0
+         
+         for cycle_result in cycle_output["cycle_results"]:
+             task_id = cycle_result["task_id"]
+@@ -169,6 +217,16 @@ class EvaLoopEvaluator:
+             
+             # Find corresponding prompt result
+             prompt_result = next(r for r in model_result["prompt_results"] if r["task_id"] == task_id)
++
++            # A model call that still failed after retries says nothing about the model:
++            # stop this task's loop without counting the cycle as a failed generation.
++            if self._has_task_error(cycle_result):
++                api_errors += 1
++                cycle_result["success"] = None
++                prompt_result["cycles"].append(cycle_result)
++                prompt_result["api_error_cycle"] = current_cycle
++                self.logger.error(f"{task_id}: model call failed in cycle {current_cycle}; task stopped")
++                continue
+             
+             # Test and validate the code generation output
+             success = self._test_and_validate_output(cycle_result, tasks, task_id, problem, tester)
+@@ -183,6 +241,15 @@ class EvaLoopEvaluator:
+                 next_prompt = self._prepare_next_cycle_prompt(cycle_result, tasks, task_id)
+                 if next_prompt:
+                     next_cycle_prompts.append(next_prompt)
++
++        results = cycle_output["cycle_results"]
++        if results and api_errors / len(results) > self.config.max_api_error_rate:
++            # Systemic failure (outage, exhausted credits, ...): keep what we have and stop
++            self._save_results([model_result], self.config.loop)
++            raise RuntimeError(
++                f"{api_errors}/{len(results)} prompts of cycle {current_cycle} failed with API errors "
++                f"(> {self.config.max_api_error_rate:.0%}); aborting. Completed cycles are saved."
++            )
+         
+         return next_cycle_prompts
+     
+@@ -204,7 +271,8 @@ class EvaLoopEvaluator:
+         test_results = self._test_python_code(code_output, task_id, problem, tester)
+         
+         # Store test results
+-        test_results["plus_details"] = "".join(map(str, test_results["plus_details"]))
++        # Tester errors return no details; .get keeps them from crashing the whole run
++        test_results["plus_details"] = "".join(map(str, test_results.get("plus_details", [])))
+         cycle_result["test_results"] = test_results
+         
+         return test_results.get("success", False)
+@@ -235,6 +303,12 @@ class EvaLoopEvaluator:
+                 prompt_result["successful_cycles"] == self.config.max_cycles
+             )
+         
++        # Tasks stopped by a model call that failed after retries (see _process_cycle_results)
++        model_result["api_error_tasks"] = [
++            r["task_id"] for r in model_result["prompt_results"] if "api_error_cycle" in r
++        ]
++        model_result["complete"] = True
++        
+         # Calculate average successful cycles
+         if model_result["prompt_results"]:
+             avg_cycles = sum(
+diff --git a/evaloop/models/factory.py b/evaloop/models/factory.py
+index 1061582..d366266 100644
+--- a/evaloop/models/factory.py
++++ b/evaloop/models/factory.py
+@@ -4,9 +4,10 @@ import logging
+ from typing import Dict, Any
+ 
+ from .base import BaseLLM
+-from .open_source import HuggingFaceLLM
+-from .open_source_vllm import VllmLLM
++# Local-model backends are imported on demand: open_source_vllm raises ImportError
++# without vLLM, which made every model type (including API models) unusable.
+ from .closed_source import OpenAILLM
++from .openai_compatible import OpenAICompatibleLLM
+ 
+ 
+ class ModelFactory:
+@@ -43,11 +44,15 @@ class ModelFactory:
+         self.logger.debug(f"Creating model with config: {sanitized_config}")
+         
+         if model_type in ["llama", "deepseek", "huggingface", "open_source"]:
++            from .open_source import HuggingFaceLLM
+             return HuggingFaceLLM(model_config)
+         elif model_type in ["vllm"]:
++            from .open_source_vllm import VllmLLM
+             return VllmLLM(model_config)
+         elif model_type in ["openai", "chatgpt", "closed_source"]:
+             return OpenAILLM(model_config)
++        elif model_type == "openai_compatible":
++            return OpenAICompatibleLLM(model_config)
+         else:
+             raise ValueError(f"Unsupported model type: {model_type}")
+     
+@@ -66,5 +71,6 @@ class ModelFactory:
+             "vllm",
+             "openai",
+             "chatgpt",
+-            "closed_source"
++            "closed_source",
++            "openai_compatible",
+         ]
+diff --git a/evaloop/models/openai_compatible.py b/evaloop/models/openai_compatible.py
+new file mode 100644
+index 0000000..442ef21
+--- /dev/null
++++ b/evaloop/models/openai_compatible.py
+@@ -0,0 +1,57 @@
++"""OpenAI-compatible API models (e.g. OpenRouter) with fail-loud errors and concurrency."""
++
++import logging
++import time
++from concurrent.futures import ThreadPoolExecutor
++from typing import Any, Dict, List
++
++from .closed_source import OpenAILLM
++
++# Prefixes OpenAILLM.generate returns instead of raising when a request fails
++_ERROR_PREFIXES = ("Error generating response", "Error: Still received empty response")
++
++
++class APICallError(RuntimeError):
++    """An API request failed; the model never produced an output for this prompt."""
++
++
++class OpenAICompatibleLLM(OpenAILLM):
++    """OpenAILLM for any OpenAI-compatible endpoint, such as OpenRouter.
++
++    Differences from OpenAILLM, all needed to run API models inside the loop:
++      - API failures raise APICallError instead of returning an error string, which the
++        loop would otherwise test as generated code (or carry forward as the next prompt)
++        and count as a model failure.
++      - Optional OpenRouter provider routing (``provider`` config) so that every request
++        of a run is served by the same provider/quantization.
++      - batch_generate runs requests concurrently; BatchEvaluationCycle uses it automatically.
++    """
++
++    def __init__(self, model_config: Dict[str, Any]):
++        super().__init__(model_config)
++        # OpenRouter provider routing preferences, e.g. {"order": ["deepinfra"], "allow_fallbacks": False}
++        self.provider = model_config.get("provider")
++        self.max_workers = model_config.get("max_workers", 8)
++        # Retries on top of OpenAILLM's own, for failures it does not retry (e.g. connection errors)
++        self.call_attempts = model_config.get("call_attempts", 3)
++        self.call_backoff = model_config.get("call_backoff", 10.0)
++        self.logger = logging.getLogger(__name__)
++
++    def generate(self, prompt: str, **kwargs) -> str:
++        """Generate a response, raising APICallError if every attempt fails."""
++        if self.provider:
++            kwargs.setdefault("extra_body", {"provider": self.provider})
++
++        for attempt in range(1, self.call_attempts + 1):
++            response = super().generate(prompt, **kwargs)
++            if not response.startswith(_ERROR_PREFIXES):
++                return response
++            self.logger.warning(f"API call failed (attempt {attempt}/{self.call_attempts}): {response}")
++            if attempt < self.call_attempts:
++                time.sleep(self.call_backoff * attempt)
++        raise APICallError(response)
++
++    def batch_generate(self, prompts: List[str]) -> List[str]:
++        """Generate responses for prompts concurrently, preserving order."""
++        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
++            return list(pool.map(self.generate, prompts))
+diff --git a/evaloop/tasks/__init__.py b/evaloop/tasks/__init__.py
+index 66200cb..10551a2 100644
+--- a/evaloop/tasks/__init__.py
++++ b/evaloop/tasks/__init__.py
+@@ -10,6 +10,7 @@ from .factory import TaskFactory, register_task
+ from .code_generation import CodeGenerationTask
+ from .code_summarization import CodeSummarizationTask
+ from .code_translation import CodeTranslationTask
++from .code_pseudocode import CodePseudocodeTask
+ 
+ __all__ = [
+     "BaseTask",
+@@ -18,4 +19,5 @@ __all__ = [
+     "CodeGenerationTask",
+     "CodeSummarizationTask",
+     "CodeTranslationTask",
++    "CodePseudocodeTask",
+ ]
+diff --git a/evaloop/tasks/code_pseudocode.py b/evaloop/tasks/code_pseudocode.py
+new file mode 100644
+index 0000000..8e6314b
+--- /dev/null
++++ b/evaloop/tasks/code_pseudocode.py
+@@ -0,0 +1,46 @@
++import re
++
++from .code_summarization import CodeSummarizationTask
++from .factory import register_task
++
++
++@register_task("code_pseudocode")
++class CodePseudocodeTask(CodeSummarizationTask):
++    """Task for converting code into language-agnostic pseudocode.
++
++    The inverse of code generation in the code <-> pseudocode loop. It only
++    replaces the natural-language summary with pseudocode: postprocess is
++    inherited unchanged, so the pseudocode is wrapped as a docstring with the
++    cycle's assert line re-attached, exactly like the standard loop. This keeps
++    the function name/signature anchored across cycles and makes the summary
++    format the only difference from the generation <-> summarization loop.
++    """
++
++    DEFAULT_PROMPT_TEMPLATE = (
++        "Convert the following Python code into pseudocode:\n\n"
++        "```\n{code}\n```\n\n"
++        "Write language-agnostic pseudocode using plain structured keywords "
++        "(FUNCTION, SET, IF, ELSE, FOR EACH, WHILE, RETURN). Do not use Python syntax "
++        "and do not copy the Python code verbatim. "
++        "Return only the pseudocode, without explanations or comments."
++    )
++
++    def create_prompt(self, input_text: str) -> str:
++        """Create a prompt for code-to-pseudocode conversion."""
++        prompt_template = self.task_config.get("prompt_template", self.DEFAULT_PROMPT_TEMPLATE)
++        return prompt_template.format(code=input_text)
++
++    def extract_output(self, raw_response: str) -> str:
++        """Extract pseudocode from LLM response.
++
++        Models often wrap pseudocode in a fenced block; the fence is formatting,
++        not content, so the first fenced block is used when present (same rule
++        as code extraction). Otherwise the whole response is used.
++        """
++        pattern = r"```(?:\w+)?\s*([\s\S]*?)```"
++        matches = re.findall(pattern, raw_response)
++
++        if matches:
++            return matches[0].strip()
++
++        return raw_response.strip()
+diff --git a/scripts/analyze_b1.py b/scripts/analyze_b1.py
+new file mode 100644
+index 0000000..2fb9751
+--- /dev/null
++++ b/scripts/analyze_b1.py
+@@ -0,0 +1,301 @@
++"""Compare the code <-> pseudocode loop (B1) against the standard loop on the same models/tasks.
++
++Usage:
++    python scripts/analyze_b1.py --results results --out results/analysis \
++        [--package <assignment4-data>/loops] [--sample 15] [--seed 0]
++
++Inputs are the full-run results files written by `evaloop evaluate`
++(<model>_code_generation_{summarization,pseudocode}_results.json). Outputs in --out:
++    b1_stats.json     every number below, per model
++    b1_report.md      readable tables: metrics, paired comparison, ranking, drift checks
++    b1_failures.md    seeded sample of failed loops for manual inspection, plus
++                      "broken by pseudocode only" / "broken by standard only" case lists
++"""
++
++import argparse
++import ast
++import json
++import random
++import sys
++from math import comb
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from evaloop.analysis import metrics  # noqa: E402
++
++STD, PSEUDO = "code_generation_summarization", "code_generation_pseudocode"
++
++
++# ----------------------------------------------------------------------------- loading
++
++def load_runs(results_dir: Path) -> dict:
++    """{model: {loop: run}} for complete, full (non --limit) runs."""
++    runs = {}
++    for path in sorted(results_dir.glob("*_results.json")):
++        (run,) = json.loads(path.read_text(encoding="utf-8"))
++        if not run.get("complete") or run["config"].get("limit"):
++            continue
++        runs.setdefault(run["config"]["model"], {})[run["loop"]] = run
++    return {m: r for m, r in runs.items() if STD in r and PSEUDO in r}
++
++
++def by_task(run: dict) -> dict:
++    return {t["task_id"]: t for t in run["prompt_results"]}
++
++
++def inverse_body(wrapped: str) -> str:
++    """The model's summary/pseudocode without the docstring wrapper and assert line."""
++    lines = wrapped.strip().splitlines()
++    return "\n".join(lines[1:-2]).strip()
++
++
++def parses_as_python(text: str) -> bool:
++    try:
++        ast.parse(text)
++        return True
++    except SyntaxError:
++        return False
++
++
++# ----------------------------------------------------------------------------- statistics
++
++def sign_test(wins: int, losses: int) -> float:
++    """Exact two-sided sign test p-value (ties excluded)."""
++    n = wins + losses
++    if n == 0:
++        return 1.0
++    k = min(wins, losses)
++    tail = sum(comb(n, i) for i in range(k + 1)) / 2 ** n
++    return min(1.0, 2 * tail)
++
++
++def run_metrics(run: dict) -> dict:
++    cycles = [t["successful_cycles"] for t in run["prompt_results"]]
++    m = run["max_cycles"]
++    return {
++        "n_tasks": len(cycles),
++        "pass@1": metrics.pass_at_k(cycles, 1) / len(cycles),
++        "pass@M": metrics.pass_at_k(cycles, m) / len(cycles),
++        "ASL_pow": metrics.asl_pow(cycles, m),
++        "ASL_bias": metrics.asl_bias(cycles, m),
++        "pass_drop": metrics.pass_drop(cycles, m),
++        "histogram": metrics.cycle_histogram(cycles, m),
++        "api_error_tasks": len(run.get("api_error_tasks", [])),
++    }
++
++
++def paired(std: dict, pseudo: dict) -> dict:
++    """Per-task comparison of sustained loops on the same tasks."""
++    s, p = by_task(std), by_task(pseudo)
++    ids = sorted(set(s) & set(p))
++    diff = [p[i]["successful_cycles"] - s[i]["successful_cycles"] for i in ids]
++    wins, losses = sum(d > 0 for d in diff), sum(d < 0 for d in diff)
++    # Cycle 1 runs the identical generation prompt in both loops: disagreement here is
++    # run-to-run nondeterminism, not an effect of the loop type.
++    c1 = [(s[i]["successful_cycles"] >= 1, p[i]["successful_cycles"] >= 1) for i in ids]
++    both_c1 = [i for i in ids if s[i]["successful_cycles"] >= 1 and p[i]["successful_cycles"] >= 1]
++    d2 = [p[i]["successful_cycles"] - s[i]["successful_cycles"] for i in both_c1]
++    w2, l2 = sum(d > 0 for d in d2), sum(d < 0 for d in d2)
++    return {
++        "tasks": len(ids),
++        "pseudo_longer": wins,
++        "std_longer": losses,
++        "ties": len(ids) - wins - losses,
++        "mean_diff": sum(diff) / len(ids),
++        "sign_test_p": sign_test(wins, losses),
++        "cycle1_agreement": sum(a == b for a, b in c1) / len(ids),
++        "cycle1_pass_std_only": sum(a and not b for a, b in c1),
++        "cycle1_pass_pseudo_only": sum(b and not a for a, b in c1),
++        "given_both_pass_cycle1": {
++            "tasks": len(both_c1),
++            "pseudo_longer": w2,
++            "std_longer": l2,
++            "mean_diff": sum(d2) / len(d2) if d2 else 0.0,
++            "sign_test_p": sign_test(w2, l2),
++        },
++    }
++
++
++def inverse_checks(run: dict) -> dict:
++    """Format checks on the inverse task's outputs, and length drift across cycles."""
++    texts = [c["task_2_output"] for t in run["prompt_results"] for c in t["cycles"] if "task_2_output" in c]
++    bodies = [inverse_body(x) for x in texts]
++    by_cycle = {}
++    for t in run["prompt_results"]:
++        for c in t["cycles"]:
++            if "task_2_output" in c:
++                by_cycle.setdefault(c["cycle"], []).append(len(inverse_body(c["task_2_output"])))
++    return {
++        "outputs": len(texts),
++        "assert_anchor_kept": sum(x.strip().splitlines()[-2].lstrip().startswith("assert") for x in texts) / len(texts),
++        "valid_python": sum(map(parses_as_python, bodies)) / len(bodies),
++        "contains_def": sum("def " in b for b in bodies) / len(bodies),
++        "mean_chars": sum(map(len, bodies)) / len(bodies),
++        "mean_chars_by_cycle": {k: round(sum(v) / len(v), 1) for k, v in sorted(by_cycle.items())},
++    }
++
++
++def package_agreement(run: dict, package_dir: Path, package_id: str) -> dict:
++    """Agreement of our standard-loop run with the published run of the same model."""
++    path = package_dir / f"{package_id}.json"
++    if not path.exists():
++        return {}
++    published = {t["task_id"]: t["successful_cycles"] for t in json.loads(path.read_text(encoding="utf-8"))["tasks"]}
++    ours = {t["task_id"]: t["successful_cycles"] for t in run["prompt_results"]}
++    ids = sorted(set(ours) & set(published))
++    pub_cycles = [published[i] for i in ids]
++    return {
++        "package_model_id": package_id,
++        "tasks": len(ids),
++        "same_sustained_loops": sum(ours[i] == published[i] for i in ids) / len(ids),
++        "same_cycle1_outcome": sum((ours[i] >= 1) == (published[i] >= 1) for i in ids) / len(ids),
++        "published_ASL_pow": metrics.asl_pow(pub_cycles, 10),
++        "published_pass@1": metrics.pass_at_k(pub_cycles, 1) / len(ids),
++    }
++
++
++# ----------------------------------------------------------------------------- failure dossier
++
++def failure_entry(task: dict) -> dict:
++    cycles = task["cycles"]
++    failing = cycles[-1]
++    previous = cycles[-2] if len(cycles) > 1 else None
++    tests = failing.get("test_results", {})
++    return {
++        "task_id": task["task_id"],
++        "failed_cycle": failing["cycle"],
++        "initial_prompt": task["initial_prompt"].strip(),
++        "prompt_of_failing_cycle": (previous or {}).get("task_2_output", task["initial_prompt"]).strip(),
++        "last_passing_code": (previous or {}).get("task_1_output"),
++        "failing_code": failing.get("task_1_output"),
++        "base_passed": tests.get("base_success"),
++        "plus_passed": tests.get("plus_success"),
++    }
++
++
++def failed_loops(run: dict) -> list:
++    """Loops that broke after at least one successful cycle (cycle-1 failures are plain
++    generation failures, identical in both loop types)."""
++    return [t for t in run["prompt_results"]
++            if 1 <= t["successful_cycles"] < run["max_cycles"] and "api_error_cycle" not in t]
++
++
++def write_dossier(path: Path, runs: dict, sample: int, seed: int) -> dict:
++    rng = random.Random(seed)
++    out = ["# B1 failed-loop dossier\n",
++           f"Seeded sample (seed={seed}) of loops that failed after >= 1 successful cycle. "
++           "For each: the prompt that fed the failing cycle, the code that last passed, and the "
++           "failing code. Classify each manually (e.g. requirement dropped, cannot implement own "
++           "description, extraction/format issue, over-reliance on the assert line).\n"]
++    sampled = {}
++    for model, loops in runs.items():
++        for loop, label, k in ((PSEUDO, "pseudocode loop", sample), (STD, "standard loop", max(5, sample // 3))):
++            pool = failed_loops(loops[loop])
++            picks = sorted(rng.sample(pool, min(k, len(pool))), key=lambda t: t["task_id"])
++            sampled[f"{model} | {label}"] = [t["task_id"] for t in picks]
++            out.append(f"\n## {model} - {label} ({len(picks)} of {len(pool)} mid-loop failures)\n")
++            for t in picks:
++                e = failure_entry(t)
++                out.append(f"\n### {e['task_id']} - failed at cycle {e['failed_cycle']} "
++                           f"(base={e['base_passed']}, plus={e['plus_passed']})\n")
++                out.append("**Original prompt**\n```\n" + e["initial_prompt"] + "\n```\n")
++                out.append("**Prompt of the failing cycle**\n```\n" + e["prompt_of_failing_cycle"] + "\n```\n")
++                out.append("**Last passing code**\n```python\n" + str(e["last_passing_code"]) + "\n```\n")
++                out.append("**Failing code**\n```python\n" + str(e["failing_code"]) + "\n```\n")
++                out.append("**My Classification:** \n")
++
++        s, p = by_task(loops[STD]), by_task(loops[PSEUDO])
++        broke_pseudo = [i for i in s if s[i]["successful_cycles"] == 10 and 1 <= p[i]["successful_cycles"] < 10]
++        broke_std = [i for i in s if p[i]["successful_cycles"] == 10 and 1 <= s[i]["successful_cycles"] < 10]
++        out.append(f"\n## {model} - representative-case candidates\n")
++        out.append(f"- Broken by pseudocode only (std survived 10): {', '.join(broke_pseudo) or 'none'}\n")
++        out.append(f"- Broken by standard only (pseudocode survived 10): {', '.join(broke_std) or 'none'}\n")
++    path.write_text("".join(out), encoding="utf-8")
++    return sampled
++
++
++# ----------------------------------------------------------------------------- report
++
++def write_report(path: Path, stats: dict) -> None:
++    lines = ["# B1 results: code <-> pseudocode vs standard loop\n",
++             "\n## Metrics per run\n",
++             "| model | loop | n | pass@1 | pass@10 | ASL_pow | ASL_bias | pass_drop | API-error tasks |\n",
++             "|---|---|---|---|---|---|---|---|---|\n"]
++    for model, s in stats["models"].items():
++        for loop in (STD, PSEUDO):
++            m = s["metrics"][loop]
++            lines.append(f"| {model} | {loop} | {m['n_tasks']} | {m['pass@1']:.3f} | {m['pass@M']:.3f} | "
++                         f"{m['ASL_pow']:.3f} | {m['ASL_bias']:.3f} | {m['pass_drop']:.3f} | {m['api_error_tasks']} |\n")
++    lines += ["\n## Paired per-task comparison (pseudocode minus standard, sustained loops)\n",
++              "| model | pseudo longer | std longer | ties | mean diff | sign-test p | cycle-1 agreement | "
++              "given both pass c1: pseudo/std longer, p |\n|---|---|---|---|---|---|---|---|\n"]
++    for model, s in stats["models"].items():
++        p = s["paired"]
++        g = p["given_both_pass_cycle1"]
++        lines.append(f"| {model} | {p['pseudo_longer']} | {p['std_longer']} | {p['ties']} | {p['mean_diff']:+.3f} | "
++                     f"{p['sign_test_p']:.3g} | {p['cycle1_agreement']:.3f} | "
++                     f"{g['pseudo_longer']}/{g['std_longer']}, p={g['sign_test_p']:.3g} |\n")
++    lines += ["\n## Ranking by ASL_pow\n"]
++    for key, order in stats["ranking"].items():
++        lines.append(f"- {key}: {' > '.join(order)}\n")
++    lines += ["\n## Inverse-task output checks\n",
++              "| model | loop | outputs | assert kept | valid Python | contains `def` | mean chars | mean chars by cycle |\n",
++              "|---|---|---|---|---|---|---|---|\n"]
++    for model, s in stats["models"].items():
++        for loop in (STD, PSEUDO):
++            c = s["inverse_checks"][loop]
++            lines.append(f"| {model} | {loop} | {c['outputs']} | {c['assert_anchor_kept']:.3f} | {c['valid_python']:.3f} | "
++                         f"{c['contains_def']:.3f} | {c['mean_chars']:.0f} | {c['mean_chars_by_cycle']} |\n")
++    if any(s.get("package") for s in stats["models"].values()):
++        lines += ["\n## Standard loop vs published data package (same model)\n",
++                  "| model | package id | same sustained loops | same cycle-1 outcome | published ASL_pow | "
++                  "published pass@1 |\n|---|---|---|---|---|---|\n"]
++        for model, s in stats["models"].items():
++            g = s.get("package")
++            if g:
++                lines.append(f"| {model} | {g['package_model_id']} | {g['same_sustained_loops']:.3f} | "
++                             f"{g['same_cycle1_outcome']:.3f} | {g['published_ASL_pow']:.3f} | {g['published_pass@1']:.3f} |\n")
++    path.write_text("".join(lines), encoding="utf-8")
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--results", type=Path, default=Path("results"))
++    parser.add_argument("--out", type=Path, default=Path("results/analysis"))
++    parser.add_argument("--package", type=Path, help="data package loops/ directory (optional cross-check)")
++    parser.add_argument("--package_ids", default="", help="model=package_id pairs, comma-separated")
++    parser.add_argument("--sample", type=int, default=15, help="failed pseudocode loops sampled per model")
++    parser.add_argument("--seed", type=int, default=0)
++    args = parser.parse_args()
++
++    runs = load_runs(args.results)
++    if not runs:
++        sys.exit(f"No model has both complete full runs in {args.results}")
++    package_ids = dict(pair.split("=", 1) for pair in args.package_ids.split(",") if pair)
++
++    stats = {"models": {}, "ranking": {}}
++    for model, loops in runs.items():
++        entry = {
++            "metrics": {loop: run_metrics(loops[loop]) for loop in (STD, PSEUDO)},
++            "paired": paired(loops[STD], loops[PSEUDO]),
++            "inverse_checks": {loop: inverse_checks(loops[loop]) for loop in (STD, PSEUDO)},
++        }
++        if args.package and model in package_ids:
++            entry["package"] = package_agreement(loops[STD], args.package, package_ids[model])
++        stats["models"][model] = entry
++    for loop in (STD, PSEUDO):
++        stats["ranking"][loop] = sorted(runs, key=lambda m: -stats["models"][m]["metrics"][loop]["ASL_pow"])
++    if all("package" in s for s in stats["models"].values()):
++        stats["ranking"]["published (data package)"] = sorted(
++            runs, key=lambda m: -stats["models"][m]["package"]["published_ASL_pow"])
++
++    args.out.mkdir(parents=True, exist_ok=True)
++    stats["dossier_sample"] = write_dossier(args.out / "b1_failures.md", runs, args.sample, args.seed)
++    (args.out / "b1_stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
++    write_report(args.out / "b1_report.md", stats)
++    print(f"wrote {args.out}/b1_report.md, b1_failures.md, b1_stats.json")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/make_summary.py b/scripts/make_summary.py
+new file mode 100644
+index 0000000..41d706d
+--- /dev/null
++++ b/scripts/make_summary.py
+@@ -0,0 +1,88 @@
++"""Build summary.csv (one row per run) from EvaLoop results files.
++
++Usage:
++    python scripts/make_summary.py results/*_results.json --out summary.csv \
++        [--extended summary_extended.csv]
++
++summary.csv uses the assignment's header:
++    model,configuration,n_tasks,success_rate,asl_score
++where success_rate = pass@1 / T and asl_score = ASL_pow = sum_i n_i * i^2 / (T * M), i.e. the
++leaderboard's `aslScore` (no similarity judge). Metrics come from evaloop.analysis.metrics.
++
++The optional extended CSV adds ASL_bias, pass_drop, the loop histogram and the number of
++tasks stopped by API errors (which are kept in T and counted at the loops they had sustained).
++"""
++
++import argparse
++import csv
++import json
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from evaloop.analysis import metrics  # noqa: E402
++
++CONFIGURATION_NAMES = {
++    "code_generation_summarization": "standard-mbpp-plus",
++    "code_generation_pseudocode": "pseudocode-mbpp-plus",
++}
++
++
++def summarize(path: Path) -> dict:
++    """Compute the metrics of one results file (a single-model run)."""
++    (run,) = json.loads(path.read_text(encoding="utf-8"))
++    if not run.get("complete", True):
++        raise ValueError(f"{path} is an incomplete (aborted) run")
++    if run.get("config", {}).get("limit"):
++        raise ValueError(f"{path} is a --limit smoke run, not a full run")
++
++    cycles = [task["successful_cycles"] for task in run["prompt_results"]]
++    max_cycles = run["max_cycles"]
++    return {
++        "model": run["config"]["model"],
++        "configuration": CONFIGURATION_NAMES[run["loop"]],
++        "n_tasks": len(cycles),
++        "success_rate": metrics.pass_at_k(cycles, 1) / len(cycles),
++        "asl_score": metrics.asl_pow(cycles, max_cycles),
++        "asl_bias": metrics.asl_bias(cycles, max_cycles),
++        "pass_drop": metrics.pass_drop(cycles, max_cycles),
++        "pass_at_max": metrics.pass_at_k(cycles, max_cycles) / len(cycles),
++        "histogram": " ".join(map(str, metrics.cycle_histogram(cycles, max_cycles))),
++        "api_error_tasks": len(run.get("api_error_tasks", [])),
++        "results_file": path.name,
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("results", nargs="+", type=Path)
++    parser.add_argument("--out", type=Path, default=Path("summary.csv"))
++    parser.add_argument("--extended", type=Path)
++    args = parser.parse_args()
++
++    rows = sorted((summarize(p) for p in args.results), key=lambda r: (r["model"], r["configuration"]))
++
++    with args.out.open("w", newline="") as f:
++        writer = csv.writer(f)
++        writer.writerow(["model", "configuration", "n_tasks", "success_rate", "asl_score"])
++        for r in rows:
++            writer.writerow([r["model"], r["configuration"], r["n_tasks"],
++                             f"{r['success_rate']:.3f}", f"{r['asl_score']:.3f}"])
++    print(f"wrote {args.out} ({len(rows)} runs)")
++
++    if args.extended:
++        with args.extended.open("w", newline="") as f:
++            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
++            writer.writeheader()
++            for r in rows:
++                writer.writerow({k: f"{v:.4f}" if isinstance(v, float) else v for k, v in r.items()})
++        print(f"wrote {args.extended}")
++
++    for r in rows:
++        if r["api_error_tasks"]:
++            print(f"WARNING: {r['results_file']}: {r['api_error_tasks']} task(s) stopped by API errors")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/run_in_docker.sh b/scripts/run_in_docker.sh
+new file mode 100644
+index 0000000..88f23ad
+--- /dev/null
++++ b/scripts/run_in_docker.sh
+@@ -0,0 +1,43 @@
++#!/usr/bin/env bash
++# Run one EvaLoop evaluation of an OpenRouter model inside the sandbox image.
++#
++# Usage: scripts/run_in_docker.sh <openrouter model id> <provider slug> <loop> [extra evaloop args]
++#   e.g. scripts/run_in_docker.sh google/gemma-3-12b-it deepinfra/bf16 code_generation_pseudocode
++#
++# The API key is read from $KEY_FILE (default: openrouter.key) and passed to the container
++# by variable name only, so it never appears on a command line. Results are written to
++# ./results/<model>_<loop>_results.json and logs to ./logs/<model>_<loop>/; the container
++# can see no other host directory.
++set -euo pipefail
++
++MODEL=$1 PROVIDER=$2 LOOP=$3
++shift 3
++KEY_FILE=${KEY_FILE:-openrouter.key}
++IMAGE=${IMAGE:-evaloop-b1}
++NAME=$(echo "${MODEL##*/}" | tr '.:' '__')
++
++# One log directory per run, so parallel runs do not interleave in logs/evaloop.log
++LOG_DIR="logs/${NAME}_${LOOP}"
++mkdir -p results "$LOG_DIR"
++# Git Bash on Windows needs a Windows-style path for the bind mounts
++HOST_DIR="$(pwd -W 2>/dev/null || pwd)"
++
++OPENROUTER_API_KEY=$(tr -d '[:space:]' < "$KEY_FILE")
++export OPENROUTER_API_KEY
++
++MSYS_NO_PATHCONV=1 docker run --rm \
++  --memory 6g --cpus 4 --pids-limit 512 \
++  --cap-drop ALL --security-opt no-new-privileges \
++  -e OPENROUTER_API_KEY \
++  -v "$HOST_DIR/results:/app/results" \
++  -v "$HOST_DIR/$LOG_DIR:/app/logs" \
++  "$IMAGE" evaluate \
++  --model "$MODEL" \
++  --loop "$LOOP" \
++  --api_base_url https://openrouter.ai/api/v1 \
++  --provider_order "$PROVIDER" \
++  --max_cycles 10 \
++  --temperature 0.0 \
++  --output_dir results/ \
++  --experiment_name "$NAME" \
++  "$@"
+diff --git a/tests/test_evaluator_robustness.py b/tests/test_evaluator_robustness.py
+new file mode 100644
+index 0000000..e7db1fb
+--- /dev/null
++++ b/tests/test_evaluator_robustness.py
+@@ -0,0 +1,144 @@
++"""Offline tests of EvaLoopEvaluator's handling of failed model calls (no evalplus/torch/API)."""
++
++import json
++import sys
++import types
++
++import pytest
++
++from evaloop.core.config import EvaluationConfig
++from evaloop.tasks import TaskFactory
++
++from conftest import GENERATION_CONFIG, MBPP_STYLE_PROMPT, SUMMARIZATION_CONFIG
++
++CODE = "def similar_elements(a, b):\n    return tuple(set(a) & set(b))"
++
++
++@pytest.fixture
++def evaluator_cls(monkeypatch):
++    """Import the evaluator with its heavy dependencies (evalplus, torch) stubbed out."""
++    py_testing = types.ModuleType("evaloop.evaluation.py_testing")
++    py_testing.EvalPlusCodeTester = object
++    py_testing.load_mbpp_dataset = lambda: ({}, {})
++    factory = types.ModuleType("evaloop.models.factory")
++    factory.ModelFactory = object
++    monkeypatch.setitem(sys.modules, "evaloop.evaluation.py_testing", py_testing)
++    monkeypatch.setitem(sys.modules, "evaloop.models.factory", factory)
++    monkeypatch.delitem(sys.modules, "evaloop.core.evaluator", raising=False)
++    from evaloop.core.evaluator import EvaLoopEvaluator
++
++    yield EvaLoopEvaluator
++    monkeypatch.delitem(sys.modules, "evaloop.core.evaluator", raising=False)
++
++
++class FlakyModel:
++    """Returns passing code/summaries; raises for prompts while ``failures[marker]`` > 0."""
++
++    max_workers = 4
++
++    def __init__(self, failures=None):
++        self.failures = dict(failures or {})
++
++    def generate(self, prompt):
++        for marker, remaining in self.failures.items():
++            if marker in prompt and remaining != 0:
++                self.failures[marker] = remaining - 1
++                raise RuntimeError(f"API down for {marker}")
++        if prompt.startswith("Generate Python code"):
++            return f"```python\n{CODE}\n```"
++        return "write a python function to find shared elements"
++
++    def batch_generate(self, prompts):
++        return [self.generate(p) for p in prompts]
++
++
++class PassingTester:
++    """Every generated code passes, without plus_details for one task (tester error shape)."""
++
++    def test_code(self, code, task_id, entry_point):
++        if task_id == "Mbpp/no-details":
++            return {"success": True}
++        return {"success": True, "plus_details": [True, True]}
++
++
++def _run(evaluator_cls, tmp_path, model, task_ids, **config_kwargs):
++    config = EvaluationConfig(
++        model="gpt-4", output_dir=str(tmp_path), experiment_name="exp", max_cycles=3, **config_kwargs
++    )
++    evaluator = evaluator_cls(config)
++    tasks = [TaskFactory().create_task(GENERATION_CONFIG), TaskFactory().create_task(SUMMARIZATION_CONFIG)]
++    prompts = [{"task_id": t, "prompt": MBPP_STYLE_PROMPT.replace("shared", t)} for t in task_ids]
++    problems = {t: {"entry_point": "similar_elements"} for t in task_ids}
++    return evaluator._run_evaluation_cycles(model, tasks, prompts, problems, PassingTester())
++
++
++def _by_id(result):
++    return {r["task_id"]: r for r in result["prompt_results"]}
++
++
++def test_clean_run(evaluator_cls, tmp_path):
++    result = _run(evaluator_cls, tmp_path, FlakyModel(), ["Mbpp/1", "Mbpp/2"])
++    assert [r["successful_cycles"] for r in result["prompt_results"]] == [3, 3]
++    assert result["complete"] is True
++    assert result["api_error_tasks"] == []
++
++
++def test_transient_failure_is_retried(evaluator_cls, tmp_path):
++    # Mbpp/1's prompts fail twice (the first attempt and one retry), then succeed
++    result = _run(evaluator_cls, tmp_path, FlakyModel({"Mbpp/1": 2}), ["Mbpp/1", "Mbpp/2"])
++    assert _by_id(result)["Mbpp/1"]["successful_cycles"] == 3
++    assert result["api_error_tasks"] == []
++    assert all(c["success"] is True for c in _by_id(result)["Mbpp/1"]["cycles"])
++
++
++def test_persistent_failure_is_not_a_model_failure(evaluator_cls, tmp_path):
++    task_ids = [f"Mbpp/{i}" for i in range(30)]  # 1/30 failing is below the 5% abort rate
++    result = _run(evaluator_cls, tmp_path, FlakyModel({"Mbpp/7 ": -1}), task_ids)
++    failed = _by_id(result)["Mbpp/7"]
++    assert failed["api_error_cycle"] == 1
++    assert failed["cycles"][-1]["success"] is None
++    assert "test_results" not in failed["cycles"][-1]
++    assert result["api_error_tasks"] == ["Mbpp/7"]
++    assert all(_by_id(result)[t]["successful_cycles"] == 3 for t in task_ids if t != "Mbpp/7")
++
++
++def test_summary_failure_does_not_count_as_pass_then_vanish(evaluator_cls, tmp_path):
++    # Only the summarization prompt (which contains the code) fails, and only in cycle 2
++    class SummaryFlaky(FlakyModel):
++        def __init__(self):
++            super().__init__()
++            self.summary_calls = 0
++
++        def generate(self, prompt):
++            if not prompt.startswith("Generate Python code"):
++                self.summary_calls += 1
++                if self.summary_calls >= 2:
++                    raise RuntimeError("summary call failed")
++            return super().generate(prompt)
++
++    task_ids = [f"Mbpp/{i}" for i in range(1)]
++    with pytest.raises(RuntimeError, match="aborting"):
++        _run(evaluator_cls, tmp_path, SummaryFlaky(), task_ids)
++    saved = json.loads((tmp_path / "exp_code_generation_summarization_results.json").read_text())[0]
++    (task,) = saved["prompt_results"]
++    assert task["successful_cycles"] == 1
++    assert task["api_error_cycle"] == 2
++
++
++def test_systemic_failure_aborts_with_checkpoint(evaluator_cls, tmp_path):
++    with pytest.raises(RuntimeError, match="aborting"):
++        _run(evaluator_cls, tmp_path, FlakyModel({"Generate": -1}), ["Mbpp/1", "Mbpp/2"])
++    saved = json.loads((tmp_path / "exp_code_generation_summarization_results.json").read_text())
++    assert saved[0]["complete"] is False
++
++
++def test_missing_plus_details_does_not_crash(evaluator_cls, tmp_path):
++    result = _run(evaluator_cls, tmp_path, FlakyModel(), ["Mbpp/no-details"])
++    assert result["prompt_results"][0]["successful_cycles"] == 3
++
++
++def test_checkpoint_written_each_cycle(evaluator_cls, tmp_path):
++    _run(evaluator_cls, tmp_path, FlakyModel(), ["Mbpp/1"], limit=1)
++    saved = json.loads((tmp_path / "exp_code_generation_summarization_results.json").read_text())
++    assert saved[0]["loop"] == "code_generation_summarization"
++    assert saved[0]["config"]["limit"] == 1
+diff --git a/tests/test_openai_compatible.py b/tests/test_openai_compatible.py
+new file mode 100644
+index 0000000..1c6360c
+--- /dev/null
++++ b/tests/test_openai_compatible.py
+@@ -0,0 +1,114 @@
++"""Tests for OpenAI-compatible endpoint routing and the OpenAICompatibleLLM wrapper (no API calls)."""
++
++import pytest
++
++from evaloop.core.config import EvaluationConfig
++
++
++class TestRouting:
++    def _model_config(self, tmp_path, **kwargs):
++        return EvaluationConfig(output_dir=str(tmp_path), **kwargs).get_model_config()
++
++    def test_base_url_routes_to_openai_compatible(self, tmp_path, monkeypatch):
++        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
++        config = self._model_config(
++            tmp_path,
++            model="qwen/qwen-2.5-coder-32b-instruct",
++            api_base_url="https://openrouter.ai/api/v1",
++        )
++        assert config["type"] == "openai_compatible"
++        assert config["model_id"] == "qwen/qwen-2.5-coder-32b-instruct"
++        assert config["base_url"] == "https://openrouter.ai/api/v1"
++        assert config["api_key"] == "sk-test"
++        assert config["max_tokens"] == 1024
++        assert config["temperature"] == 0.0
++        assert "provider" not in config
++
++    def test_provider_pinning(self, tmp_path):
++        config = self._model_config(
++            tmp_path,
++            model="qwen/qwen-2.5-coder-32b-instruct",
++            api_base_url="https://openrouter.ai/api/v1",
++            provider_order=["deepinfra"],
++        )
++        assert config["provider"] == {"order": ["deepinfra"], "allow_fallbacks": False}
++
++    def test_without_base_url_routing_is_unchanged(self, tmp_path):
++        assert self._model_config(tmp_path, model="gpt-4")["type"] == "openai"
++
++
++class TestOpenAICompatibleLLM:
++    @pytest.fixture
++    def llm_cls(self, monkeypatch):
++        pytest.importorskip("openai")
++        from evaloop.models import closed_source
++        from evaloop.models.openai_compatible import OpenAICompatibleLLM
++
++        calls = []
++        responses = []
++
++        def fake_generate(self, prompt, **kwargs):
++            calls.append((prompt, kwargs))
++            return responses.pop(0) if responses else f"out:{prompt}"
++
++        monkeypatch.setattr(closed_source.OpenAILLM, "generate", fake_generate)
++        OpenAICompatibleLLM.calls = calls
++        OpenAICompatibleLLM.responses = responses
++        return OpenAICompatibleLLM
++
++    def _make(self, llm_cls, **kwargs):
++        config = {"name": "m", "model_id": "m", "api_key": "sk-test", "call_backoff": 0}
++        config.update(kwargs)
++        return llm_cls(config)
++
++    def test_passes_provider_routing(self, llm_cls):
++        provider = {"order": ["deepinfra"], "allow_fallbacks": False}
++        assert self._make(llm_cls, provider=provider).generate("p") == "out:p"
++        assert llm_cls.calls[0][1] == {"extra_body": {"provider": provider}}
++
++    def test_no_provider_sends_no_extra_body(self, llm_cls):
++        self._make(llm_cls).generate("p")
++        assert llm_cls.calls[0][1] == {}
++
++    def test_error_string_raises_after_retries(self, llm_cls):
++        from evaloop.models.openai_compatible import APICallError
++
++        llm_cls.responses.extend(["Error generating response: 402 insufficient credits"] * 3)
++        with pytest.raises(APICallError, match="402"):
++            self._make(llm_cls, call_attempts=3).generate("p")
++        assert len(llm_cls.calls) == 3
++
++    def test_empty_response_error_raises(self, llm_cls):
++        from evaloop.models.openai_compatible import APICallError
++
++        llm_cls.responses.append("Error: Still received empty response after multiple attempts.")
++        with pytest.raises(APICallError):
++            self._make(llm_cls, call_attempts=1).generate("p")
++
++    def test_recovers_after_transient_error(self, llm_cls):
++        llm_cls.responses.extend(["Error generating response: Connection error.", "def f(): pass"])
++        assert self._make(llm_cls).generate("p") == "def f(): pass"
++
++    def test_batch_generate_preserves_order(self, llm_cls):
++        prompts = [f"p{i}" for i in range(20)]
++        outputs = self._make(llm_cls, max_workers=4).batch_generate(prompts)
++        assert outputs == [f"out:{p}" for p in prompts]
++
++
++def test_factory_creates_api_model_without_torch_or_vllm(monkeypatch):
++    # Regression: the factory used to import the vLLM backend eagerly, and that module
++    # raises ImportError without vLLM, so no model type could be created.
++    pytest.importorskip("openai")
++    import sys
++
++    monkeypatch.setitem(sys.modules, "torch", None)
++    monkeypatch.setitem(sys.modules, "vllm", None)
++    for name in ("evaloop.models.factory", "evaloop.models.open_source", "evaloop.models.open_source_vllm"):
++        monkeypatch.delitem(sys.modules, name, raising=False)
++    from evaloop.models.factory import ModelFactory
++    from evaloop.models.openai_compatible import OpenAICompatibleLLM
++
++    model = ModelFactory().create_model(
++        {"type": "openai_compatible", "name": "m", "model_id": "m", "api_key": "sk-test"}
++    )
++    assert isinstance(model, OpenAICompatibleLLM)
+diff --git a/tests/test_pseudocode.py b/tests/test_pseudocode.py
+new file mode 100644
+index 0000000..4290d52
+--- /dev/null
++++ b/tests/test_pseudocode.py
+@@ -0,0 +1,106 @@
++"""Unit tests for the code <-> pseudocode loop task."""
++
++import pytest
++
++from evaloop.core.config import SUPPORTED_LOOPS, EvaluationConfig
++from evaloop.evaluation.cycle import BatchEvaluationCycle
++from evaloop.tasks import CodePseudocodeTask, TaskFactory
++
++from conftest import ASSERT_LINE, GENERATION_CONFIG, MBPP_STYLE_PROMPT, SUMMARIZATION_CONFIG
++
++PSEUDOCODE = "FUNCTION similar_elements(a, b)\n    RETURN items present in both a and b"
++
++
++class TestCodePseudocodeTask:
++    def test_registered(self):
++        task = TaskFactory().create_task({"type": "code_pseudocode"})
++        assert isinstance(task, CodePseudocodeTask)
++
++    def test_create_prompt_default_template(self):
++        task = CodePseudocodeTask({"type": "code_pseudocode"})
++        prompt = task.create_prompt("def f(x): return x")
++        assert "def f(x): return x" in prompt
++        assert "pseudocode" in prompt
++        assert "Do not use Python syntax" in prompt
++
++    def test_create_prompt_uses_configured_template(self):
++        task = CodePseudocodeTask({"prompt_template": "P: {code}"})
++        assert task.create_prompt("x = 1") == "P: x = 1"
++
++    def test_extract_output_fenced_block(self):
++        task = CodePseudocodeTask({})
++        response = f"Here is the pseudocode:\n```\n{PSEUDOCODE}\n```\nDone."
++        assert task.extract_output(response) == PSEUDOCODE
++
++    def test_extract_output_no_fence_returns_stripped_response(self):
++        task = CodePseudocodeTask({})
++        assert task.extract_output(f"  {PSEUDOCODE}  \n") == PSEUDOCODE
++
++    def test_postprocess_retains_assert_line(self):
++        task = CodePseudocodeTask({})
++        result = task.postprocess(PSEUDOCODE, {"cycle_input": MBPP_STYLE_PROMPT})
++        assert result == f'"""\n{PSEUDOCODE}\n{ASSERT_LINE}\n"""\n'
++
++    def test_assert_line_survives_repeated_cycles(self):
++        # Each cycle's input is the previous cycle's wrapped output, so the
++        # anchor must still be found at [-2] after many cycles.
++        task = CodePseudocodeTask({})
++        cycle_input = MBPP_STYLE_PROMPT
++        for _ in range(10):
++            cycle_input = task.postprocess(PSEUDOCODE, {"cycle_input": cycle_input})
++        assert cycle_input.splitlines()[-2] == ASSERT_LINE
++
++    def test_is_not_testable(self):
++        assert CodePseudocodeTask({}).produces_testable_code is False
++
++
++def test_cycle_with_pseudocode_task():
++    code = "def similar_elements(a, b):\n    return tuple(set(a) & set(b))"
++
++    class Model:
++        def generate(self, prompt):
++            if prompt.startswith("Generate Python code"):
++                return f"```python\n{code}\n```"
++            return f"```\n{PSEUDOCODE}\n```"
++
++    factory = TaskFactory()
++    tasks = [factory.create_task(GENERATION_CONFIG), factory.create_task({"type": "code_pseudocode"})]
++    result = BatchEvaluationCycle(Model(), tasks).run_single_cycle(
++        [{"task_id": "Mbpp/2", "prompt": MBPP_STYLE_PROMPT}], cycle_number=1
++    )
++    (res,) = result["cycle_results"]
++    assert res["task_1_output"] == code
++    assert res["task_2_output"] == f'"""\n{PSEUDOCODE}\n{ASSERT_LINE}\n"""\n'
++
++
++class TestLoopSelection:
++    def _config(self, tmp_path, **kwargs):
++        return EvaluationConfig(model="gpt-4", output_dir=str(tmp_path), **kwargs)
++
++    def test_default_loop_is_standard(self, tmp_path):
++        assert self._config(tmp_path).loop == "code_generation_summarization"
++
++    def test_standard_loop_prompts_unchanged(self, tmp_path):
++        # The baseline must use exactly the prompts that produced the published data
++        configs = self._config(tmp_path).get_task_configs("code_generation_summarization")
++        assert configs == [GENERATION_CONFIG, SUMMARIZATION_CONFIG]
++
++    def test_pseudocode_loop_shares_generation_step(self, tmp_path):
++        config = self._config(tmp_path, loop="code_generation_pseudocode")
++        configs = config.get_task_configs(config.loop)
++        assert configs == [GENERATION_CONFIG, {"type": "code_pseudocode"}]
++
++    def test_every_supported_loop_builds_tasks(self, tmp_path):
++        factory = TaskFactory()
++        for loop in SUPPORTED_LOOPS:
++            tasks = [factory.create_task(c) for c in self._config(tmp_path).get_task_configs(loop)]
++            assert [t.produces_testable_code for t in tasks] == [True, False]
++
++    def test_unknown_loop_rejected(self, tmp_path):
++        with pytest.raises(ValueError, match="loop must be one of"):
++            self._config(tmp_path, loop="nope")
++
++    def test_loop_recorded_in_config_dict(self, tmp_path):
++        assert self._config(tmp_path, loop="code_generation_pseudocode").to_dict()["loop"] == (
++            "code_generation_pseudocode"
++        )

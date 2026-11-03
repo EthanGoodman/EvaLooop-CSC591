@@ -71,7 +71,9 @@ class EvaLoopCLI:
         self,
         model: str,
         dataset: str = "mbpp_plus",
+        loop: str = "code_generation_summarization",
         max_cycles: int = 10,
+        limit: Optional[int] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
         output_dir: str = "results/",
@@ -92,6 +94,11 @@ class EvaLoopCLI:
         preferred_batch_size: int = 64,
         is_chat_model: bool = True,
         system_prompt: str = "You are a helpful programming assistant.",
+        api_base_url: Optional[str] = None,
+        api_key_env: str = "OPENROUTER_API_KEY",
+        provider_order: Optional[str] = None,
+        allow_fallbacks: bool = False,
+        max_workers: int = 8,
     ) -> Dict[str, Any]:
         """
         Run code generation and summarization evaluation experiment.
@@ -107,6 +114,9 @@ class EvaLoopCLI:
             model: Single model name/path to evaluate.
                    Examples: "gpt-4", "Qwen/Qwen2.5-Coder-32B-Instruct"
             dataset: Dataset to use for evaluation. Currently only "mbpp_plus" is supported.
+            loop: Loop type: "code_generation_summarization" (standard loop) or
+                  "code_generation_pseudocode" (code <-> pseudocode loop).
+            limit: Evaluate only the first N tasks (for smoke tests; omit for real runs).
             max_cycles: Maximum number of evaluation cycles to run.
             temperature: Temperature for model generation (0.0 for greedy decoding).
             top_p: Top-p (nucleus) sampling parameter.
@@ -114,6 +124,12 @@ class EvaLoopCLI:
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR).
             experiment_name: Name for the experiment (auto-generated if None).
             openai_api_key: OpenAI API key (can also be set via OPENAI_API_KEY env var).
+            api_base_url: OpenAI-compatible endpoint, e.g. "https://openrouter.ai/api/v1". When set,
+                          --model is that endpoint's model id and is served via the API.
+            api_key_env: Environment variable holding the endpoint's API key.
+            provider_order: Comma-separated OpenRouter provider slugs to pin (e.g. "deepinfra").
+            allow_fallbacks: Whether OpenRouter may fall back to providers outside provider_order.
+            max_workers: Concurrent API requests per batch.
             gpu_ids: Comma-separated GPU IDs for VLLM models (e.g., "0,1,2,3").
             tensor_parallel_size: Number of GPUs for tensor parallelism.
             gpu_memory_utilization: GPU memory utilization ratio for VLLM.
@@ -183,7 +199,9 @@ class EvaLoopCLI:
         config = EvaluationConfig(
             model=model.strip(),
             dataset=dataset,
+            loop=loop,
             max_cycles=max_cycles,
+            limit=limit,
             temperature=temperature,
             top_p=top_p,
             output_dir=output_dir,
@@ -203,7 +221,14 @@ class EvaLoopCLI:
             is_chat_model=is_chat_model,
             system_prompt=system_prompt,
             openai_api_key=openai_api_key,
+            api_base_url=api_base_url,
+            api_key_env=api_key_env,
+            provider_order=_split_list_arg(provider_order) if provider_order else None,
+            allow_fallbacks=allow_fallbacks,
+            max_workers=max_workers,
         )
+        if api_base_url and not os.environ.get(api_key_env):
+            raise ValueError(f"--api_base_url is set but the API key variable {api_key_env} is empty")
         # Log model type detection results
         model_config = config.get_model_config()
         model_type = model_config["type"]
@@ -214,12 +239,12 @@ class EvaLoopCLI:
                            f"batch_size={model_config['batch_config']['preferred_batch_size']}")
         elif model_type == "huggingface":
             self.logger.info(f"  HuggingFace config: device={model_config['device']}")
-        elif model_type in ["openai", "anthropic"]:
+        elif model_type in ["openai", "anthropic", "openai_compatible"]:
             self.logger.info(f"  API config: model_id={model_config['model_id']}")
 
         # Create and run evaluator
         evaluator = EvaLoopEvaluator(config)
-        results = evaluator.run_code_generation_summarization()
+        results = evaluator.run()
 
         self.logger.info("Evaluation completed successfully")
         return results

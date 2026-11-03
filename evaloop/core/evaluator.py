@@ -2,6 +2,7 @@
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List
 from pathlib import Path
 
@@ -34,14 +35,14 @@ class EvaLoopEvaluator:
         
         self.logger.info(f"Initialized EvaLoopEvaluator with config: {config.experiment_name}")
     
-    def run_code_generation_summarization(self) -> List[Dict[str, Any]]:
+    def run(self) -> List[Dict[str, Any]]:
         """
-        Run code generation and summarization evaluation.
+        Run the loop selected by ``config.loop`` (e.g. code generation <-> summarization).
         
         Returns:
             List of evaluation results (single model result in list for consistency).
         """
-        self.logger.info("Starting code generation and summarization evaluation")
+        self.logger.info(f"Starting {self.config.loop} evaluation")
         
         # Setup components
         model = self._create_model()
@@ -53,8 +54,12 @@ class EvaLoopEvaluator:
         model_result = self._run_evaluation_cycles(model, tasks, prompts, py_problems, tester)
         
         # Save and return results
-        self._save_results([model_result], "code_generation_summarization")
+        self._save_results([model_result], self.config.loop)
         return [model_result]
+
+    def run_code_generation_summarization(self) -> List[Dict[str, Any]]:
+        """Backward-compatible alias of run(); runs the loop selected by ``config.loop``."""
+        return self.run()
     
     def run_code_translation(self) -> Dict[str, Any]:
         """
@@ -77,7 +82,7 @@ class EvaLoopEvaluator:
     
     def _create_tasks(self):
         """Create task instances."""
-        task_configs = self.config.get_task_configs("code_generation_summarization")
+        task_configs = self.config.get_task_configs(self.config.loop)
         tasks = [self.task_factory.create_task(config) for config in task_configs]
         self.logger.info(f"Created {len(tasks)} tasks for evaluation")
         return tasks
@@ -94,6 +99,9 @@ class EvaLoopEvaluator:
                 "task_id": task_id,
                 "prompt": problem["prompt"]
             })
+        if self.config.limit:
+            # First N tasks in dataset order; meant for smoke tests, not for reported runs
+            prompts = prompts[: self.config.limit]
         
         self.logger.info(f"Prepared {len(prompts)} prompts from MBPP dataset")
         return prompts, py_problems
@@ -121,13 +129,16 @@ class EvaLoopEvaluator:
             current_cycle += 1
             self.logger.info(f"Starting cycle {current_cycle}/{self.config.max_cycles}")
             
-            # Run single cycle
+            # Run single cycle, re-running prompts whose model calls failed
             cycle_output = cycle_runner.run_single_cycle(current_prompts, current_cycle)
+            self._retry_errored_prompts(cycle_runner, model, cycle_output, current_prompts, current_cycle)
             
             # Process results and prepare for next cycle
             current_prompts = self._process_cycle_results(
                 cycle_output, model_result, tasks, py_problems, tester, current_cycle
             )
+            # Checkpoint, so an aborted run keeps every completed cycle
+            self._save_results([model_result], self.config.loop)
             
             if not current_prompts:
                 self.logger.info(f"All prompts failed or completed after cycle {current_cycle}")
@@ -138,12 +149,48 @@ class EvaLoopEvaluator:
         
         return model_result
     
+    @staticmethod
+    def _has_task_error(cycle_result: Dict[str, Any]) -> bool:
+        """True if a model call of this cycle failed (an infrastructure error, not a model output)."""
+        return any(key.startswith("task_") and key.endswith("_error") for key in cycle_result)
+
+    def _retry_errored_prompts(self, cycle_runner, model, cycle_output, prompts, cycle_number):
+        """Re-run, in place, the cycle of every prompt whose model call raised.
+
+        Failures are retried one prompt at a time, so a single failing prompt cannot fail a
+        whole batch again. Prompts still failing after ``cycle_retries`` keep their error.
+        """
+        results = cycle_output["cycle_results"]
+        prompt_by_id = {prompt["task_id"]: prompt for prompt in prompts}
+        workers = getattr(model, "max_workers", 1)
+
+        def rerun(prompt):
+            return cycle_runner.run_single_cycle([prompt], cycle_number)["cycle_results"][0]
+
+        for attempt in range(1, self.config.cycle_retries + 1):
+            errored = [i for i, result in enumerate(results) if self._has_task_error(result)]
+            if not errored:
+                return
+            self.logger.warning(
+                f"Cycle {cycle_number}: re-running {len(errored)} prompt(s) whose model calls failed "
+                f"(retry {attempt}/{self.config.cycle_retries})"
+            )
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                reruns = list(pool.map(rerun, [prompt_by_id[results[i]["task_id"]] for i in errored]))
+            for index, result in zip(errored, reruns):
+                results[index] = result
+    
     def _initialize_model_result(self, model, prompts) -> Dict[str, Any]:
         """Initialize the model result structure."""
         model_result = {
             "model": str(model),
             # Loop budget M; needed by the analyzer to normalize the ASL metrics
             "max_cycles": self.config.max_cycles,
+            # Provenance: which loop and settings produced this run
+            "loop": self.config.loop,
+            "config": self.config.to_dict(),
+            # False in per-cycle checkpoints; True once every cycle has run
+            "complete": False,
             "prompt_results": []
         }
         
@@ -162,6 +209,7 @@ class EvaLoopEvaluator:
     def _process_cycle_results(self, cycle_output, model_result, tasks, py_problems, tester, current_cycle) -> List[Dict[str, Any]]:
         """Process cycle results and return prompts for next cycle."""
         next_cycle_prompts = []
+        api_errors = 0
         
         for cycle_result in cycle_output["cycle_results"]:
             task_id = cycle_result["task_id"]
@@ -169,6 +217,16 @@ class EvaLoopEvaluator:
             
             # Find corresponding prompt result
             prompt_result = next(r for r in model_result["prompt_results"] if r["task_id"] == task_id)
+
+            # A model call that still failed after retries says nothing about the model:
+            # stop this task's loop without counting the cycle as a failed generation.
+            if self._has_task_error(cycle_result):
+                api_errors += 1
+                cycle_result["success"] = None
+                prompt_result["cycles"].append(cycle_result)
+                prompt_result["api_error_cycle"] = current_cycle
+                self.logger.error(f"{task_id}: model call failed in cycle {current_cycle}; task stopped")
+                continue
             
             # Test and validate the code generation output
             success = self._test_and_validate_output(cycle_result, tasks, task_id, problem, tester)
@@ -183,6 +241,15 @@ class EvaLoopEvaluator:
                 next_prompt = self._prepare_next_cycle_prompt(cycle_result, tasks, task_id)
                 if next_prompt:
                     next_cycle_prompts.append(next_prompt)
+
+        results = cycle_output["cycle_results"]
+        if results and api_errors / len(results) > self.config.max_api_error_rate:
+            # Systemic failure (outage, exhausted credits, ...): keep what we have and stop
+            self._save_results([model_result], self.config.loop)
+            raise RuntimeError(
+                f"{api_errors}/{len(results)} prompts of cycle {current_cycle} failed with API errors "
+                f"(> {self.config.max_api_error_rate:.0%}); aborting. Completed cycles are saved."
+            )
         
         return next_cycle_prompts
     
@@ -204,7 +271,8 @@ class EvaLoopEvaluator:
         test_results = self._test_python_code(code_output, task_id, problem, tester)
         
         # Store test results
-        test_results["plus_details"] = "".join(map(str, test_results["plus_details"]))
+        # Tester errors return no details; .get keeps them from crashing the whole run
+        test_results["plus_details"] = "".join(map(str, test_results.get("plus_details", [])))
         cycle_result["test_results"] = test_results
         
         return test_results.get("success", False)
@@ -234,6 +302,12 @@ class EvaLoopEvaluator:
             prompt_result["max_cycles_reached"] = (
                 prompt_result["successful_cycles"] == self.config.max_cycles
             )
+        
+        # Tasks stopped by a model call that failed after retries (see _process_cycle_results)
+        model_result["api_error_tasks"] = [
+            r["task_id"] for r in model_result["prompt_results"] if "api_error_cycle" in r
+        ]
+        model_result["complete"] = True
         
         # Calculate average successful cycles
         if model_result["prompt_results"]:
